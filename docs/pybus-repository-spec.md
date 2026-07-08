@@ -11,8 +11,8 @@ Target repository: `nanaduah1/pybus`
 
 `pybus` will be a standalone Python framework for asynchronous and
 request-oriented message handling. It extracts the current monolith's event
-bus into a dedicated repository with a clean core and optional framework
-extras.
+bus into a dedicated repository with a clean core, an explicit compatibility
+bridge, and optional framework extras.
 
 The package is intentionally broader than an event bus:
 
@@ -20,7 +20,7 @@ The package is intentionally broader than an event bus:
 - **Commands** represent intent and usually have one handler.
 - **Requests/Responses** represent a query or workflow that expects a reply.
 
-The runtime must support reliability primitives from day one:
+The runtime must support the core reliability primitives from day one:
 
 - a transport abstraction
 - outbox/inbox storage abstractions
@@ -30,7 +30,8 @@ The runtime must support reliability primitives from day one:
 - optional Django integration
 
 The goal is to keep the core dependency-light, portable, and usable in plain
-Python services while still supporting Django as a first-class integration.
+Python services while still supporting Django as a first-class integration
+through a separate follow-up track.
 
 ---
 
@@ -46,9 +47,9 @@ This repository will be the system of record for:
 - transport abstractions
 - handler registration
 - listener / dispatcher runtime
-- outbox and inbox abstractions
+- outbox and inbox abstractions as follow-up track work
 - command and request/response semantics
-- reference implementations for Redis and Django
+- reference implementations for Redis and Django on the follow-up track
 
 It will **not** contain application-specific domain publishers or handlers from
 `skuulbe-api`. Those remain in application repositories and only depend on
@@ -62,10 +63,10 @@ It will **not** contain application-specific domain publishers or handlers from
 
 - Core message framework
 - Transport abstraction
-- Redis transport adapter
-- Django integration adapter
+- Redis transport adapter planning and compatibility boundary definition
+- Django integration adapter planning and compatibility boundary definition
 - Message registry
-- Outbox and inbox abstractions
+- Outbox and inbox abstractions as a documented follow-up track
 - Retry and batching primitives
 - Request/reply correlation support
 - Documentation and examples
@@ -79,6 +80,7 @@ It will **not** contain application-specific domain publishers or handlers from
 - provider integrations for billing, messaging, payments, or reports
 - any hard dependency on Django in the core package
 - any hard dependency on Redis in the core package
+- implementation of durability/sync adapters in the v1 core slice
 
 ---
 
@@ -498,6 +500,8 @@ The current codebase should migrate incrementally.
 - add compatibility shims in `core.events`
 - keep existing imports working
 - switch internals to the new package behind the scenes
+- keep the v1 core slice focused on primitives and contracts
+- treat durability/sync as follow-up work, not as the core release boundary
 
 ### 12.2 Second phase
 
@@ -510,6 +514,8 @@ The current codebase should migrate incrementally.
 - move outbox/inbox-backed reliability into production paths
 - retire direct Redis-push publishing paths
 - remove compatibility shims
+- close the follow-up durability/sync track only after the bridge has served
+  migration safely
 
 ---
 
@@ -523,6 +529,7 @@ The current codebase should migrate incrementally.
 - registry
 - transport interface
 - in-memory transport for tests
+- v1 core boundary documentation
 
 ### Milestone 2: Redis extra
 

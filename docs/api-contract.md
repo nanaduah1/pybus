@@ -40,6 +40,11 @@ from pybus.integrations.django import DjangoBusAdapter
 These optional integrations must not be imported by the core package during
 module import.
 
+The v1 core package surface is intentionally smaller than the eventual
+durability/sync track. Outbox, inbox, Redis transport, and Django integration
+remain optional follow-up layers even though their contracts are described in
+this repository.
+
 ---
 
 ## 2. Message Contract
@@ -219,6 +224,10 @@ Transport must not:
 - perform message deduplication
 - enforce handler retry logic
 
+The first transport slice is the abstract contract plus the in-memory test
+transport. Backend-specific durability and sync adapters are documented
+separately so the v1 core remains dependency-light.
+
 ---
 
 ## 7. Registry Contract
@@ -334,4 +343,3 @@ is intentionally introduced:
 - Django as the first reference framework extra
 
 These defaults are currently aligned with the existing monolith behavior.
-

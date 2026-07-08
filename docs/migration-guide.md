@@ -13,6 +13,10 @@ This guide describes how to move from the current `core.events` framework to
 The migration should let existing code continue to work while the underlying
 framework moves to the new repository.
 
+The first milestone is the core v1 boundary. Durability, sync, Redis adapter,
+and Django adapter work belong to the follow-up track and should not be
+mistaken for the initial core release.
+
 The migration path should preserve:
 
 - event handler registration
@@ -32,6 +36,7 @@ At this phase:
 - existing code still imports `core.events.*`
 - `core.events.*` internally forwards to `pybus`
 - Redis payloads may still need pickle compatibility during drain-down
+- the bridge is the compatibility layer, not the definition of the v1 core
 
 ---
 
@@ -65,6 +70,8 @@ During migration:
 - handler functions may accept new typed message objects
 - compatibility facades may adapt old `Event` wrappers
 - dead-letter behavior must remain intact
+- handler adapters may live in the bridge while core message classes stay
+  portable
 
 ---
 
@@ -90,6 +97,7 @@ Use this phase for:
 - money-related flows
 - job orchestration flows
 - request/response flows that need stronger reliability
+- these are follow-up track concerns, not prerequisites for the core v1 slice
 
 ---
 
@@ -127,4 +135,3 @@ Before switching a feature, confirm:
 - the handler is idempotent
 - the failure path still routes correctly
 - test coverage exists for the migration path
-
