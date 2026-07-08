@@ -1,4 +1,4 @@
 def test_pybus_imports():
-  import pybus
+    import pybus
 
-  assert pybus is not None
+    assert pybus is not None

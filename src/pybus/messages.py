@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 
 from pybus._codec import decode_value, encode_value
 from pybus.envelope import MessageEnvelope
+from pybus.exceptions import InvalidMessageDefinitionError
 
 
 @dataclass
@@ -25,9 +26,9 @@ class BaseMessage:
 
     def validate(self) -> "BaseMessage":
         if not self.message_type:
-            raise ValueError("message_type is required")
+            raise InvalidMessageDefinitionError("message_type is required")
         if not isinstance(self.headers, dict):
-            raise TypeError("headers must be a dictionary")
+            raise InvalidMessageDefinitionError("headers must be a dictionary")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -48,20 +49,35 @@ class BaseMessage:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BaseMessage":
-        expires_at = data.get("expires_at")
-        if isinstance(expires_at, str):
-            expires_at = datetime.fromisoformat(expires_at)
-        return cls(
-            message_type=data["message_type"],
-            payload=decode_value(data.get("payload")),
-            headers=decode_value(data.get("headers") or {}),
-            correlation_id=data.get("correlation_id"),
-            causation_id=data.get("causation_id"),
-            reply_to=data.get("reply_to"),
-            expires_at=expires_at,
-            content_type=data.get("content_type"),
-            content_encoding=data.get("content_encoding"),
-        ).validate()
+        try:
+            message_kind = data.get("message_kind")
+            if message_kind is not None and message_kind != cls.message_kind:
+                raise InvalidMessageDefinitionError(
+                    f"Expected message_kind={cls.message_kind!r}, got {message_kind!r}"
+                )
+            version = data.get("version")
+            if version is not None and version != cls.version:
+                raise InvalidMessageDefinitionError(
+                    f"Expected version={cls.version!r}, got {version!r}"
+                )
+            expires_at = data.get("expires_at")
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at)
+            return cls(
+                message_type=data["message_type"],
+                payload=decode_value(data.get("payload")),
+                headers=decode_value(data.get("headers") or {}),
+                correlation_id=data.get("correlation_id"),
+                causation_id=data.get("causation_id"),
+                reply_to=data.get("reply_to"),
+                expires_at=expires_at,
+                content_type=data.get("content_type"),
+                content_encoding=data.get("content_encoding"),
+            ).validate()
+        except KeyError as exc:
+            raise InvalidMessageDefinitionError(
+                f"Missing message field: {exc.args[0]}"
+            ) from exc
 
     def to_envelope(self, *, message_id: str | None = None) -> MessageEnvelope:
         return MessageEnvelope.create(
@@ -82,7 +98,7 @@ class BaseMessage:
     @classmethod
     def from_envelope(cls, envelope: MessageEnvelope) -> "BaseMessage":
         if envelope.message_kind != cls.message_kind:
-            raise ValueError(
+            raise InvalidMessageDefinitionError(
                 f"Expected message_kind={cls.message_kind!r}, got {envelope.message_kind!r}"
             )
         return cls(
@@ -130,4 +146,6 @@ def message_class_for_kind(message_kind: str) -> type[BaseMessage]:
     try:
         return MESSAGE_KIND_TO_CLASS[message_kind]
     except KeyError as exc:
-        raise ValueError(f"Unsupported message_kind: {message_kind!r}") from exc
+        raise InvalidMessageDefinitionError(
+            f"Unsupported message_kind: {message_kind!r}"
+        ) from exc

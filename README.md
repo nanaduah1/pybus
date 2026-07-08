@@ -27,3 +27,21 @@ The detailed repository spec lives in [`docs/pybus-repository-spec.md`](docs/pyb
 - [`docs/architecture-decisions.md`](docs/architecture-decisions.md)
 - [`docs/migration-guide.md`](docs/migration-guide.md)
 - [`docs/implementation-checklist.md`](docs/implementation-checklist.md)
+
+## Development
+
+This repository is managed with Poetry.
+
+Common commands:
+
+- install the project: `poetry install`
+- run the test suite: `poetry run pytest -q`
+- run lint checks: `poetry run ruff check .`
+- format code: `poetry run ruff format .`
+- inspect the lockfile: `poetry lock`
+
+Notes:
+
+- keep the core package dependency-light
+- prefer optional extras for Redis and Django integrations
+- run tests from the Poetry environment rather than a global interpreter

@@ -117,4 +117,3 @@ def test_registry_dispatch_and_listener_with_memory_transport() -> None:
     assert received[0].message_type == "student.enrolled"
     assert received[0].payload == {"student_id": "S-1"}
     assert received[0].correlation_id == "corr-3"
-
