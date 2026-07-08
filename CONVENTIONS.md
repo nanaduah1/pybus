@@ -7,7 +7,7 @@
 ## Stack
 - Language(s) & version: Python 3.11+
 - Framework(s): setuptools package, pytest test suite, ruff
-- Package/dependency manager: pip / virtualenv, optional extras in `pyproject.toml`
+- Package/dependency manager: Poetry, optional extras in `pyproject.toml`
 
 ## Architecture & patterns
 - Core package lives in `src/pybus`
@@ -32,13 +32,13 @@
 - Idempotency expectations: preserve retry and request/response semantics where relevant
 
 ## Tests
-- Test runner & how to run a single test: `pytest`; e.g. `pytest tests/core/test_imports.py`
+- Test runner & how to run a single test: `poetry run pytest`; e.g. `poetry run pytest tests/core/test_imports.py`
 - Coverage expectations: add regression tests for contract, serialization, transport, and optional-dependency boundaries
 - Fixtures/factories to use: prefer small, explicit fixtures in `tests/`
 
 ## Lint / format (exact commands)
-- Lint: `ruff check .`
-- Format: `ruff format .`
+- Lint: `poetry run ruff check .`
+- Format: `poetry run ruff format .`
 - Type-check: not configured yet; rely on tests/import smoke until a type checker is adopted
 
 ## Feature toggles
@@ -48,6 +48,12 @@
 ## Build / run for UAT
 - How to start the stack locally for end-to-end UAT: run the targeted tests or import smoke for the slice
 - Seed/demo data: not applicable
+
+## Project management
+- Install dependencies: `poetry install`
+- Refresh the lockfile: `poetry lock`
+- Run the full suite: `poetry run pytest -q`
+- Use the Poetry virtualenv for all repo-local work
 
 ## Branch & PR
 - Branch naming: `feat/<slug>` / `fix/<slug>`

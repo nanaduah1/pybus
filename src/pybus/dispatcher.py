@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pybus.envelope import MessageEnvelope
+from pybus.exceptions import HandlerNotFoundError
 from pybus.messages import BaseMessage, message_class_for_kind
 from pybus.registry import Registry
 from pybus.serializer import JsonSerializer
@@ -33,7 +34,7 @@ class Dispatcher:
             decoded.message_type,
         )
         if not handlers:
-            raise LookupError(
+            raise HandlerNotFoundError(
                 f"No handlers registered for {decoded.message_kind}:{decoded.message_type}"
             )
 

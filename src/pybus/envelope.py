@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from pybus._codec import decode_value, encode_value
+from pybus.exceptions import InvalidMessageDefinitionError
 
 
 @dataclass
@@ -60,15 +61,15 @@ class MessageEnvelope:
 
     def validate(self) -> "MessageEnvelope":
         if not self.message_id:
-            raise ValueError("message_id is required")
+            raise InvalidMessageDefinitionError("message_id is required")
         if not self.message_type:
-            raise ValueError("message_type is required")
+            raise InvalidMessageDefinitionError("message_type is required")
         if not self.message_kind:
-            raise ValueError("message_kind is required")
+            raise InvalidMessageDefinitionError("message_kind is required")
         if self.version is None:
-            raise ValueError("version is required")
+            raise InvalidMessageDefinitionError("version is required")
         if not isinstance(self.headers, dict):
-            raise TypeError("headers must be a dictionary")
+            raise InvalidMessageDefinitionError("headers must be a dictionary")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -91,24 +92,29 @@ class MessageEnvelope:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MessageEnvelope":
-        expires_at = data.get("expires_at")
-        created_at = data.get("created_at")
-        if isinstance(created_at, str):
-            created_at = datetime.fromisoformat(created_at)
-        if isinstance(expires_at, str):
-            expires_at = datetime.fromisoformat(expires_at)
-        return cls(
-            message_id=data["message_id"],
-            message_type=data["message_type"],
-            message_kind=data["message_kind"],
-            version=data["version"],
-            payload=decode_value(data["payload"]),
-            headers=decode_value(data.get("headers") or {}),
-            created_at=created_at or datetime.now(timezone.utc),
-            correlation_id=data.get("correlation_id"),
-            causation_id=data.get("causation_id"),
-            reply_to=data.get("reply_to"),
-            expires_at=expires_at,
-            content_type=data.get("content_type"),
-            content_encoding=data.get("content_encoding"),
-        ).validate()
+        try:
+            expires_at = data.get("expires_at")
+            created_at = data.get("created_at")
+            if isinstance(created_at, str):
+                created_at = datetime.fromisoformat(created_at)
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at)
+            return cls(
+                message_id=data["message_id"],
+                message_type=data["message_type"],
+                message_kind=data["message_kind"],
+                version=data["version"],
+                payload=decode_value(data["payload"]),
+                headers=decode_value(data.get("headers") or {}),
+                created_at=created_at or datetime.now(timezone.utc),
+                correlation_id=data.get("correlation_id"),
+                causation_id=data.get("causation_id"),
+                reply_to=data.get("reply_to"),
+                expires_at=expires_at,
+                content_type=data.get("content_type"),
+                content_encoding=data.get("content_encoding"),
+            ).validate()
+        except KeyError as exc:
+            raise InvalidMessageDefinitionError(
+                f"Missing envelope field: {exc.args[0]}"
+            ) from exc

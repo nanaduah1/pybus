@@ -4,6 +4,8 @@ from datetime import date, datetime, time, timezone
 from typing import Any
 from uuid import UUID
 
+from pybus.exceptions import DeserializationError
+
 _TYPE_KEY = "__pybus_type__"
 _VALUE_KEY = "value"
 
@@ -55,12 +57,24 @@ def decode_value(value: Any) -> Any:
     if isinstance(value, dict):
         type_name = value.get(_TYPE_KEY)
         if type_name == "datetime":
-            return datetime.fromisoformat(value[_VALUE_KEY])
+            try:
+                return datetime.fromisoformat(value[_VALUE_KEY])
+            except (TypeError, ValueError) as exc:
+                raise DeserializationError("Invalid datetime encoding") from exc
         if type_name == "date":
-            return date.fromisoformat(value[_VALUE_KEY])
+            try:
+                return date.fromisoformat(value[_VALUE_KEY])
+            except (TypeError, ValueError) as exc:
+                raise DeserializationError("Invalid date encoding") from exc
         if type_name == "time":
-            return time.fromisoformat(value[_VALUE_KEY])
+            try:
+                return time.fromisoformat(value[_VALUE_KEY])
+            except (TypeError, ValueError) as exc:
+                raise DeserializationError("Invalid time encoding") from exc
         if type_name == "uuid":
-            return UUID(value[_VALUE_KEY])
+            try:
+                return UUID(value[_VALUE_KEY])
+            except (TypeError, ValueError) as exc:
+                raise DeserializationError("Invalid UUID encoding") from exc
         return {key: decode_value(inner) for key, inner in value.items()}
     return value

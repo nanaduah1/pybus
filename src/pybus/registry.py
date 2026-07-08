@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from pybus.exceptions import HandlerNotFoundError
 from pybus.messages import BaseMessage
 
 Handler = Callable[[BaseMessage], object]
@@ -35,6 +36,18 @@ class Registry:
 
     def handlers_for(self, message_kind: str, message_type: str) -> tuple[Handler, ...]:
         return tuple(self._handlers.get((message_kind, message_type), ()))
+
+    def require_handler(self, message_kind: str, message_type: str) -> Handler:
+        handlers = self.handlers_for(message_kind, message_type)
+        if not handlers:
+            raise HandlerNotFoundError(
+                f"No handlers registered for {message_kind}:{message_type}"
+            )
+        if len(handlers) > 1:
+            raise ValueError(
+                f"Multiple handlers registered for {message_kind}:{message_type}"
+            )
+        return handlers[0]
 
     def clear(self) -> None:
         self._handlers.clear()
