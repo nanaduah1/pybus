@@ -1,0 +1,1 @@
+"""pybus exception hierarchy."""
