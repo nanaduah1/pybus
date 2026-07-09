@@ -24,6 +24,8 @@ def test_imports_do_not_pull_optional_integrations() -> None:
     import sys
 
     import pybus as _pybus  # noqa: F401
+    import pybus.integrations.django as _django  # noqa: F401
+    import pybus.integrations.redis as _redis  # noqa: F401
 
     assert "redis" not in sys.modules
     assert "django" not in sys.modules
