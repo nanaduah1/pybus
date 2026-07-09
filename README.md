@@ -27,6 +27,7 @@ The detailed repository spec lives in [`docs/pybus-repository-spec.md`](docs/pyb
 - [`docs/architecture-decisions.md`](docs/architecture-decisions.md)
 - [`docs/migration-guide.md`](docs/migration-guide.md)
 - [`docs/implementation-checklist.md`](docs/implementation-checklist.md)
+- [`design-docs/pybus-v1-core-and-migration-track.md`](design-docs/pybus-v1-core-and-migration-track.md)
 
 ## Development
 

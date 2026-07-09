@@ -155,3 +155,44 @@ Consequences:
 - handlers and registry must distinguish message kinds
 - request/response needs correlation and timeout semantics
 
+---
+
+## ADR-009: v1 core stops at portable primitives
+
+Decision:
+
+- The first public release should define and stabilize the portable core
+  primitives without absorbing Redis, Django, or durability adapters into the
+  base package.
+
+Rationale:
+
+- keeps the v1 slice reviewable
+- avoids coupling the public API to operational backends
+- lets migration scaffolding live separately from the core contracts
+
+Consequences:
+
+- the core package can ship dependency-light
+- Redis and Django remain explicit extras
+- outbox/inbox and sync behavior are tracked as follow-up work
+
+---
+
+## ADR-010: Durability and sync are follow-up track work
+
+Decision:
+
+- Outbox, inbox, Redis transport, Django integration, and transaction deferral
+  parity are part of the migration track, not the minimum core slice.
+
+Rationale:
+
+- these concerns are operationally important but not required to define the
+  core developer experience
+- separating them keeps the compatibility bridge easier to reason about
+
+Consequences:
+
+- documentation must point clearly from core v1 to the follow-up track
+- compatibility behavior stays explicit while the implementation layers evolve

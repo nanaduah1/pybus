@@ -24,8 +24,8 @@ The current framework behavior in `core.events` includes:
 - `ContinueProcess` for requeueing or continuing a flow
 - batched buffering using `batched:{event_type}` keys
 
-The new repo must preserve these semantics until a deliberate migration step
-changes them.
+The new repo must preserve these semantics through the compatibility bridge
+until a deliberate migration step changes them.
 
 ---
 
@@ -92,6 +92,10 @@ steps:
 
 Existing Redis messages in-flight during migration must not be silently lost.
 
+The JSON core should not be coupled to legacy pickle handling at import time.
+Mixed-read support belongs to the compatibility bridge and the follow-up
+transport track, not to the base envelope model.
+
 ---
 
 ## 4. Behavioral Compatibility Matrix
@@ -138,5 +142,7 @@ The new package should eventually expose shims that map:
 - `EventListener` -> listener facade
 - `ContinueProcess` -> flow control response object
 
-These shims are temporary and should be clearly marked deprecated when used.
+The shims are migration scaffolding. They should make the downstream codebase
+feel familiar while the core repo stays focused on the new public contracts.
 
+These shims are temporary and should be clearly marked deprecated when used.
