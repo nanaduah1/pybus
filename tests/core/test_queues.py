@@ -28,9 +28,13 @@ def test_default_queue_topology_includes_builtin_queues() -> None:
 
 
 def test_queue_topology_can_declare_extra_queues_without_losing_defaults() -> None:
-    topology = QueueTopology().declare_queue("billing").declare_queues(
-        "reports",
-        "billing",
+    topology = (
+        QueueTopology()
+        .declare_queue("billing")
+        .declare_queues(
+            "reports",
+            "billing",
+        )
     )
 
     assert topology.has_queue("billing")
