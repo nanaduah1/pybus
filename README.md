@@ -1,12 +1,17 @@
 # pybus
 
-`pybus` is a small Python messaging framework for:
+`pybus` is a Python messaging framework for applications that want to define
+events, commands, and request/response flows without rebuilding the queue,
+transport, retry, and delivery infrastructure in every service.
 
-- events
-- commands
-- request/response flows
-- transport abstraction
-- outbox/inbox reliability patterns
+The intended consumer experience is:
+
+1. install `pybus`
+2. choose a transport
+3. use the built-in default queue and dead-letter queue, then declare any
+   additional queues you need
+4. define messages and handlers
+5. let the framework wire delivery, retries, and dead-letter handling
 
 The core package stays dependency-light. Framework integrations live behind
 extras, starting with:
@@ -28,6 +33,7 @@ The detailed repository spec lives in [`docs/pybus-repository-spec.md`](docs/pyb
 - [`docs/migration-guide.md`](docs/migration-guide.md)
 - [`docs/implementation-checklist.md`](docs/implementation-checklist.md)
 - [`design-docs/pybus-v1-core-and-migration-track.md`](design-docs/pybus-v1-core-and-migration-track.md)
+- [`docs/developer-experience-contract.md`](docs/developer-experience-contract.md)
 
 ## Development
 

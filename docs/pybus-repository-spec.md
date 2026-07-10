@@ -23,7 +23,7 @@ The package is intentionally broader than an event bus:
 The runtime must support the core reliability primitives from day one:
 
 - a transport abstraction
-- outbox/inbox storage abstractions
+- outbox/inbox storage abstractions as part of the public contract
 - JSON message envelopes
 - serializable message classes
 - optional Redis transport
@@ -47,7 +47,9 @@ This repository will be the system of record for:
 - transport abstractions
 - handler registration
 - listener / dispatcher runtime
-- outbox and inbox abstractions as follow-up track work
+- outbox and inbox interfaces as part of the core contract, with the v1 method
+  set (`add`/`claim`/`complete` and `seen`/`record`) and durable
+  implementations tracked as follow-up work
 - command and request/response semantics
 - reference implementations for Redis and Django on the follow-up track
 
@@ -66,7 +68,9 @@ It will **not** contain application-specific domain publishers or handlers from
 - Redis transport adapter planning and compatibility boundary definition
 - Django integration adapter planning and compatibility boundary definition
 - Message registry
-- Outbox and inbox abstractions as a documented follow-up track
+- Outbox and inbox interfaces as a documented core contract, with the v1
+  method set (`add`/`claim`/`complete` and `seen`/`record`) and storage
+  backends deferred to the follow-up track
 - Retry and batching primitives
 - Request/reply correlation support
 - Documentation and examples

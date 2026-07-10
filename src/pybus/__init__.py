@@ -10,11 +10,24 @@ from pybus.messages import (
     ResponseMessage,
 )
 from pybus.registry import Registry
+from pybus.queues import (
+    DEFAULT_FAILED_QUEUE_NAME,
+    DEFAULT_QUEUE_NAME,
+    DEFAULT_QUEUE_TOPOLOGY,
+    DEFAULT_SLOW_QUEUE_NAME,
+    QueueTopology,
+    declare_queue,
+    declare_queues,
+)
 from pybus.serializer import JsonSerializer
 
 __all__ = [
     "BaseMessage",
     "CommandMessage",
+    "DEFAULT_FAILED_QUEUE_NAME",
+    "DEFAULT_QUEUE_NAME",
+    "DEFAULT_QUEUE_TOPOLOGY",
+    "DEFAULT_SLOW_QUEUE_NAME",
     "Dispatcher",
     "EventMessage",
     "InboxStore",
@@ -22,8 +35,11 @@ __all__ = [
     "Listener",
     "MessageEnvelope",
     "OutboxStore",
+    "QueueTopology",
     "Registry",
     "RequestMessage",
     "ResponseMessage",
+    "declare_queue",
+    "declare_queues",
     "Transport",
 ]

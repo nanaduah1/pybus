@@ -41,9 +41,10 @@ These optional integrations must not be imported by the core package during
 module import.
 
 The v1 core package surface is intentionally smaller than the eventual
-durability/sync track. Outbox, inbox, Redis transport, and Django integration
-remain optional follow-up layers even though their contracts are described in
-this repository.
+durability/sync track. `OutboxStore` and `InboxStore` are part of the public
+core contract as optional hooks, but durable outbox/inbox implementations,
+Redis transport, and Django integration remain follow-up layers even though
+their contracts are described in this repository.
 
 ---
 
@@ -218,6 +219,34 @@ class Transport(Protocol):
 If a backend cannot support `ack`/`nack`, it must document the equivalent
 behavior and adapt to the same public semantics.
 
+### 6.1 Outbox / inbox hooks
+
+`OutboxStore` and `InboxStore` are part of the v1 contract as interfaces and
+integration points.
+
+Rules:
+
+- v1 may expose the interfaces, helper methods, and compatibility hooks
+- v1 does not need to ship durable storage backends
+- the durable implementations belong to the follow-up durability/sync track
+
+Minimum method set:
+
+```python
+class OutboxStore(Protocol):
+    def add(self, message: bytes) -> str: ...
+    def claim(self, limit: int = 100) -> list[bytes]: ...
+    def complete(self, receipt: str) -> None: ...
+
+
+class InboxStore(Protocol):
+    def seen(self, message_id: str) -> bool: ...
+    def record(self, message_id: str) -> None: ...
+```
+
+The v1 names above are the public contract. Storage backends may add extra
+capabilities, but they must preserve these methods.
+
 Transport must not:
 
 - store application state
@@ -280,8 +309,9 @@ Required behavior:
 The listener should preserve the current worker model defaults:
 
 - default queue
+- dead-letter queue
 - slow queue
-- failed queue
+- any additional queues explicitly configured by the app
 
 unless explicitly configured otherwise.
 
@@ -333,8 +363,8 @@ The following defaults should remain stable unless a versioned breaking change
 is intentionally introduced:
 
 - default queue name: `skuulbe.jobs`
+- dead-letter queue name: `skuulbe.jobs.failed`
 - slow queue name: `skuulbe.jobs.slow`
-- failed queue name: `skuulbe.jobs.failed`
 - default retry limit: `10`
 - default batched handler size: `100`
 - default batched max wait: `10`

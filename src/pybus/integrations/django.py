@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any, Callable
 
-from pybus.listener import DEFAULT_QUEUE_NAME
+from pybus.queues import DEFAULT_QUEUE_NAME
 
 
 class DjangoBusAdapter:
