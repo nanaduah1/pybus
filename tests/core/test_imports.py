@@ -10,3 +10,6 @@ def test_pybus_imports():
     assert pybus.publish_event is not None
     assert pybus.send_command is not None
     assert pybus.request is not None
+    assert pybus.event_handler is not None
+    assert pybus.command_handler is not None
+    assert pybus.request_handler is not None
