@@ -60,9 +60,7 @@ def test_command_and_request_handlers_default_to_single_handler_semantics() -> N
 
     class BillingHandlers:
         @command_handler("billing.generate_student_bill")
-        def handle_generate_student_bill(
-            self, message: CommandMessage
-        ) -> str:
+        def handle_generate_student_bill(self, message: CommandMessage) -> str:
             return f"bill:{message.payload['student_id']}"
 
         @request_handler("billing.get_invoice")
