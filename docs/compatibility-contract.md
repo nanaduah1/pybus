@@ -43,6 +43,9 @@ During migration, these legacy imports should continue to work via shims:
 
 ### 2.2 Queue names
 
+The framework should preserve the built-in queue defaults and still allow apps
+to declare extra queues as needed.
+
 The default queue names should remain:
 
 - `skuulbe.jobs`

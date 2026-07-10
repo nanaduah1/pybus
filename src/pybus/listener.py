@@ -6,12 +6,17 @@ from datetime import datetime, timezone
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import HandlerNotFoundError
+from pybus.queues import (
+    DEFAULT_FAILED_QUEUE_NAME as _DEFAULT_FAILED_QUEUE_NAME,
+    DEFAULT_QUEUE_NAME as _DEFAULT_QUEUE_NAME,
+    DEFAULT_SLOW_QUEUE_NAME as _DEFAULT_SLOW_QUEUE_NAME,
+)
 from pybus.retries import RetryPolicy, next_retry_payload
 from pybus.serializer import JsonSerializer
 
-DEFAULT_QUEUE_NAME = "skuulbe.jobs"
-DEFAULT_SLOW_QUEUE_NAME = "skuulbe.jobs.slow"
-DEFAULT_FAILED_QUEUE_NAME = "skuulbe.jobs.failed"
+DEFAULT_QUEUE_NAME = _DEFAULT_QUEUE_NAME
+DEFAULT_SLOW_QUEUE_NAME = _DEFAULT_SLOW_QUEUE_NAME
+DEFAULT_FAILED_QUEUE_NAME = _DEFAULT_FAILED_QUEUE_NAME
 
 
 class Listener:

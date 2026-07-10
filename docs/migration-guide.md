@@ -25,6 +25,10 @@ The migration path should preserve:
 - retry behavior
 - batch buffering behavior
 
+The core v1 release may already expose outbox and inbox hooks as interfaces.
+Durable storage backends and draining behavior still belong to the follow-up
+durability/sync track.
+
 ---
 
 ## 2. Phase 0: Add pybus as a dependency
@@ -99,6 +103,11 @@ Use this phase for:
 - request/response flows that need stronger reliability
 - these are follow-up track concerns, not prerequisites for the core v1 slice
 
+At this point, the app should be wiring real storage backends behind the v1
+`OutboxStore` and `InboxStore` contracts rather than introducing the concepts
+for the first time. The hooks are part of the core contract; this phase makes
+them durable.
+
 ---
 
 ## 7. Phase 5: Remove compatibility shims
@@ -122,6 +131,9 @@ This should only happen after a versioned deprecation period.
 5. worker bootstrap code
 6. outbox/inbox flows
 7. request/response flows
+
+Outbox/inbox flows should be treated as a durability upgrade path, not as a
+new core capability in v1.
 
 ---
 

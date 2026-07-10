@@ -107,7 +107,8 @@ Consequences:
 
 Decision:
 
-- Add outbox and inbox interfaces in the core design.
+- Add outbox and inbox interfaces in the core design, but keep durable storage
+  implementations outside the v1 core.
 
 Rationale:
 
@@ -117,7 +118,9 @@ Rationale:
 Consequences:
 
 - a durable dispatch path is part of the framework design
-- consumers must be able to opt into inbox deduplication
+- consumers must be able to opt into inbox deduplication when a backend is
+  available
+- the v1 release can expose hooks without shipping storage backends
 
 ---
 

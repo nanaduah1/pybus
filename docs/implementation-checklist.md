@@ -39,7 +39,7 @@ Implement in this order:
 
 The first implementation pass must not break:
 
-- default queue names
+- default queue and dead-letter queue, plus optional extra queues
 - transaction deferral semantics
 - handler retry defaults
 - batched buffer semantics
@@ -69,4 +69,3 @@ After core stabilizes:
 - Django integration extra
 
 These should remain optional and import-clean.
-
