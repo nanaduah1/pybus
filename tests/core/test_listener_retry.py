@@ -98,4 +98,14 @@ def test_listener_consumes_first_available_channel_from_sequence() -> None:
 
     assert result == "ok"
     assert received == ["student.enrolled"]
-    assert transport.consume_calls == [("queue.zero", 0), ("queue.one", 0)]
+    assert transport.consume_calls == [("queue.zero", 1), ("queue.one", 1)]
+
+
+def test_listener_blocks_boundedly_when_sequence_is_empty() -> None:
+    transport = RecordingTransport()
+    listener = Listener(transport=transport, serializer=JsonSerializer())
+
+    result = listener.listen_once(("queue.zero", "queue.one"))
+
+    assert result is None
+    assert transport.consume_calls == [("queue.zero", 1), ("queue.one", 1)]

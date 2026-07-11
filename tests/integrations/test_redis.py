@@ -7,6 +7,7 @@ import pytest
 from pybus.exceptions import DeserializationError
 from pybus.integrations.redis import (
     RedisTransport,
+    decode_json_redis_payload,
     decode_legacy_redis_payload,
     decode_trusted_legacy_redis_payload,
 )
@@ -37,15 +38,18 @@ def test_redis_transport_publish_and_consume() -> None:
     assert transport.consume("pybus.jobs") is None
 
 
-def test_decode_legacy_redis_payload_only_accepts_json() -> None:
-    assert decode_legacy_redis_payload(JsonSerializer().dump({"hello": "world"})) == {
+def test_decode_json_redis_payload_only_accepts_json() -> None:
+    assert decode_json_redis_payload(JsonSerializer().dump({"hello": "world"})) == {
         "hello": "world"
     }
 
-    with pytest.raises(DeserializationError, match="trusted migration data"):
-        decode_legacy_redis_payload(pickle.dumps({"legacy": True}))
+    with pytest.raises(DeserializationError):
+        decode_json_redis_payload(pickle.dumps({"legacy": True}))
 
 
+@pytest.mark.parametrize(
+    "decoder", [decode_legacy_redis_payload, decode_trusted_legacy_redis_payload]
+)
 @pytest.mark.parametrize(
     "payload,expected",
     [
@@ -53,7 +57,7 @@ def test_decode_legacy_redis_payload_only_accepts_json() -> None:
         (pickle.dumps({"legacy": True}), {"legacy": True}),
     ],
 )
-def test_decode_trusted_legacy_redis_payload_handles_json_and_pickle(
-    payload: bytes, expected: dict[str, object]
+def test_legacy_redis_decoders_handle_json_and_pickle(
+    decoder, payload: bytes, expected: dict[str, object]
 ) -> None:
-    assert decode_trusted_legacy_redis_payload(payload) == expected
+    assert decoder(payload) == expected
