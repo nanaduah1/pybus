@@ -170,3 +170,29 @@ def test_bind_handlers_uses_default_bus_registry_when_registry_is_omitted() -> N
     assert len(registered) == 1
     assert result == "handled"
     assert received == ["S-4"]
+
+
+def test_configure_transport_can_wire_handler_targets_without_manual_binding() -> None:
+    received: list[str] = []
+
+    class StudentHandlers:
+        @event_handler("student.enrolled")
+        def handle_enrolled(self, message: EventMessage) -> str:
+            received.append(message.payload["student_id"])
+            return "handled-by-bootstrap"
+
+    bus = configure_transport(
+        MemoryTransport(),
+        handler_targets=[StudentHandlers()],
+    )
+
+    result = bus.dispatcher.dispatch(
+        EventMessage(
+            message_type="student.enrolled",
+            payload={"student_id": "S-5"},
+        ).to_envelope(message_id="msg-7")
+    )
+
+    assert bus is get_bus()
+    assert result == "handled-by-bootstrap"
+    assert received == ["S-5"]

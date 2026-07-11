@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import time
 from dataclasses import dataclass
 from typing import cast
@@ -38,6 +39,7 @@ class Pybus:
         dispatcher: Dispatcher | None = None,
         serializer: JsonSerializer | None = None,
         topology: QueueTopology | None = None,
+        handler_targets: Sequence[object] | None = None,
     ) -> None:
         self.transport = transport
         self.dispatcher = dispatcher or Dispatcher()
@@ -50,6 +52,10 @@ class Pybus:
             dead_letter_channel=self.topology.dead_letter_queue,
         )
         self.coordinator = RequestResponseCoordinator()
+        if handler_targets:
+            from pybus.handlers import register_handlers
+
+            register_handlers(*handler_targets, registry=self.dispatcher.registry)
 
     def publish_event(
         self,
@@ -171,6 +177,7 @@ def configure_transport(
     dispatcher: Dispatcher | None = None,
     serializer: JsonSerializer | None = None,
     topology: QueueTopology | None = None,
+    handler_targets: Sequence[object] | None = None,
 ) -> Pybus:
     global _default_bus
     _default_bus = Pybus(
@@ -178,6 +185,7 @@ def configure_transport(
         dispatcher=dispatcher,
         serializer=serializer,
         topology=topology,
+        handler_targets=handler_targets,
     )
     return _default_bus
 
