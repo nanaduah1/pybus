@@ -58,6 +58,23 @@ def test_top_level_helpers_return_declarative_topologies() -> None:
     assert other_topology.has_queue("reports")
 
 
+def test_queue_topology_can_map_app_specific_queue_names_to_framework_roles() -> None:
+    topology = QueueTopology().with_queue_names(
+        default_queue="skuulbe.jobs",
+        slow_queue="skuulbe.jobs.slow",
+        dead_letter_queue="skuulbe.jobs.failed",
+    )
+
+    assert topology.default_queue == "skuulbe.jobs"
+    assert topology.slow_queue == "skuulbe.jobs.slow"
+    assert topology.dead_letter_queue == "skuulbe.jobs.failed"
+    assert topology.queues == (
+        "skuulbe.jobs",
+        "skuulbe.jobs.slow",
+        "skuulbe.jobs.failed",
+    )
+
+
 def test_queue_helpers_are_available_from_the_package_root() -> None:
     assert pybus.DEFAULT_QUEUE_NAME == DEFAULT_QUEUE_NAME
     assert pybus.DEFAULT_FAILED_QUEUE_NAME == DEFAULT_FAILED_QUEUE_NAME

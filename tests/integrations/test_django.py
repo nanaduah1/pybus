@@ -39,7 +39,7 @@ def test_django_bus_adapter_defers_within_atomic_block() -> None:
 
     transaction.callbacks[0]()
 
-    assert published == [("student.enrolled", {"student_id": "S-1"}, "skuulbe.jobs")]
+    assert published == [("student.enrolled", {"student_id": "S-1"}, "pybus.jobs")]
 
 
 def test_django_bus_adapter_publishes_immediately_outside_transaction() -> None:

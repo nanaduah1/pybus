@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-DEFAULT_QUEUE_NAME = "skuulbe.jobs"
-DEFAULT_SLOW_QUEUE_NAME = "skuulbe.jobs.slow"
-DEFAULT_FAILED_QUEUE_NAME = "skuulbe.jobs.failed"
+DEFAULT_QUEUE_NAME = "pybus.jobs"
+DEFAULT_SLOW_QUEUE_NAME = "pybus.jobs.slow"
+DEFAULT_FAILED_QUEUE_NAME = "pybus.jobs.failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +13,20 @@ class QueueTopology:
     slow_queue: str = DEFAULT_SLOW_QUEUE_NAME
     dead_letter_queue: str = DEFAULT_FAILED_QUEUE_NAME
     extra_queues: tuple[str, ...] = ()
+
+    def with_queue_names(
+        self,
+        *,
+        default_queue: str | None = None,
+        slow_queue: str | None = None,
+        dead_letter_queue: str | None = None,
+    ) -> "QueueTopology":
+        return replace(
+            self,
+            default_queue=default_queue or self.default_queue,
+            slow_queue=slow_queue or self.slow_queue,
+            dead_letter_queue=dead_letter_queue or self.dead_letter_queue,
+        )
 
     def declare_queue(self, queue_name: str) -> "QueueTopology":
         return self.declare_queues(queue_name)

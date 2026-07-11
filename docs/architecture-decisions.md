@@ -124,21 +124,23 @@ Consequences:
 
 ---
 
-## ADR-007: Preserve current queue defaults
+## ADR-007: Use framework-owned queue defaults with compatibility mapping
 
 Decision:
 
-- Keep the current default queue names as compatibility defaults.
+- Ship framework-owned default queue names and allow applications to remap
+  queue roles to deployment-specific names.
 
 Rationale:
 
-- avoids breaking existing operational assumptions
+- keeps the framework reusable outside the source application
+- still allows existing deployments to preserve their operational assumptions
 
 Defaults:
 
-- `skuulbe.jobs`
-- `skuulbe.jobs.slow`
-- `skuulbe.jobs.failed`
+- `pybus.jobs`
+- `pybus.jobs.slow`
+- `pybus.jobs.failed`
 
 ---
 

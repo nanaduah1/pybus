@@ -43,17 +43,24 @@ During migration, these legacy imports should continue to work via shims:
 
 ### 2.2 Queue names
 
-The framework should preserve the built-in queue defaults and still allow apps
-to declare extra queues as needed.
+The framework should ship with framework-owned queue defaults and still allow
+apps to declare extra queues as needed.
 
-The default queue names should remain:
+The framework defaults are:
+
+- `pybus.jobs`
+- `pybus.jobs.slow`
+- `pybus.jobs.failed`
+
+Applications migrating from the monolith should be able to map those framework
+roles onto their existing queue names, including:
 
 - `skuulbe.jobs`
 - `skuulbe.jobs.slow`
 - `skuulbe.jobs.failed`
 
-These should be configurable, but the defaults must not change during the
-compatibility phase.
+That compatibility mapping must remain configurable during the migration
+phase.
 
 ### 2.3 Transaction semantics
 
