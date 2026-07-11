@@ -131,7 +131,7 @@ Rules:
 Event handler contract:
 
 ```python
-@pybus.event_handler("student.enrolled")
+@pybus.event_handler(StudentEnrolled)
 def handle_student_enrolled(event: EventMessage) -> None:
     ...
 ```
@@ -164,7 +164,7 @@ Rules:
 Command handler contract:
 
 ```python
-@pybus.command_handler("billing.generate_student_bill")
+@pybus.command_handler(GenerateStudentBill)
 def handle_generate_student_bill(command: CommandMessage) -> None:
     ...
 ```
@@ -195,7 +195,7 @@ Required behavior:
 Response handlers:
 
 ```python
-@pybus.request_handler("billing.get_invoice")
+@pybus.request_handler(GetInvoice)
 def handle_get_invoice(request: RequestMessage) -> ResponseMessage:
     ...
 ```

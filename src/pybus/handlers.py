@@ -17,6 +17,9 @@ class HandlerSpec:
     allow_multiple: bool | None = None
 
 
+MessageBinding = str | type[BaseMessage]
+
+
 def _handler_spec(handler: object) -> HandlerSpec | None:
     spec = getattr(handler, "__pybus_handler_spec__", None)
     if spec is not None:
@@ -29,16 +32,46 @@ def _handler_spec(handler: object) -> HandlerSpec | None:
     return None
 
 
+def _resolve_message_binding(
+    message: MessageBinding,
+    *,
+    expected_kind: str,
+) -> tuple[str, str]:
+    if isinstance(message, str):
+        return expected_kind, message
+
+    if not inspect.isclass(message) or not issubclass(message, BaseMessage):
+        raise TypeError("message binding must be a message type or message_type string")
+
+    message_kind = getattr(message, "message_kind", None)
+    if message_kind != expected_kind:
+        raise ValueError(
+            f"Expected a {expected_kind} message type, got {message_kind!r}"
+        )
+
+    message_type = getattr(message, "message_type", None)
+    if not isinstance(message_type, str) or not message_type:
+        raise TypeError(
+            f"{message.__name__} must define a non-empty message_type class attribute"
+        )
+
+    return message_kind, message_type
+
+
 def _decorate_handler(
     message_kind: str,
-    message_type: str,
+    message: MessageBinding,
     *,
     allow_multiple: bool | None = None,
     registry: Registry | None = None,
 ) -> Callable[[Handler], Handler]:
+    resolved_kind, resolved_type = _resolve_message_binding(
+        message,
+        expected_kind=message_kind,
+    )
     spec = HandlerSpec(
-        message_kind=message_kind,
-        message_type=message_type,
+        message_kind=resolved_kind,
+        message_type=resolved_type,
         allow_multiple=allow_multiple,
     )
 
@@ -57,42 +90,42 @@ def _decorate_handler(
 
 
 def event_handler(
-    message_type: str,
+    message: MessageBinding,
     *,
     allow_multiple: bool | None = None,
     registry: Registry | None = None,
 ) -> Callable[[Handler], Handler]:
     return _decorate_handler(
         "event",
-        message_type,
+        message,
         allow_multiple=allow_multiple,
         registry=registry,
     )
 
 
 def command_handler(
-    message_type: str,
+    message: MessageBinding,
     *,
     allow_multiple: bool | None = None,
     registry: Registry | None = None,
 ) -> Callable[[Handler], Handler]:
     return _decorate_handler(
         "command",
-        message_type,
+        message,
         allow_multiple=allow_multiple,
         registry=registry,
     )
 
 
 def request_handler(
-    message_type: str,
+    message: MessageBinding,
     *,
     allow_multiple: bool | None = None,
     registry: Registry | None = None,
 ) -> Callable[[Handler], Handler]:
     return _decorate_handler(
         "request",
-        message_type,
+        message,
         allow_multiple=allow_multiple,
         registry=registry,
     )
