@@ -128,22 +128,38 @@ class Pybus:
             deadline = time.monotonic() + timeout
 
         while True:
+            buffered = self.coordinator.take_response(correlation_id)
+            if buffered is not None:
+                return buffered
+
             if deadline is not None and time.monotonic() >= deadline:
                 raise MessageTimeoutError(
                     f"Timed out waiting for response {correlation_id}"
                 )
 
-            raw_message = self.transport.consume(
-                reply_queue, timeout=1 if timeout is None else max(timeout, 1)
-            )
+            poll_timeout = 1
+            sleep_interval = 0.01
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MessageTimeoutError(
+                        f"Timed out waiting for response {correlation_id}"
+                    )
+                # Poll in short slices so sub-second timeouts are respected.
+                if remaining < 1:
+                    poll_timeout = 0
+                    sleep_interval = min(0.01, remaining)
+                else:
+                    poll_timeout = 1
+                    sleep_interval = 0.01
+
+            raw_message = self.transport.consume(reply_queue, timeout=poll_timeout)
             if raw_message is None:
-                time.sleep(0.01)
+                time.sleep(sleep_interval)
                 continue
 
             envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))
-            if envelope.correlation_id != correlation_id:
-                continue
-            return envelope
+            self.coordinator.store_response(envelope)
 
 
 _default_bus: Pybus | None = None

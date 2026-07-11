@@ -110,3 +110,52 @@ def test_bus_request_times_out_when_no_response_arrives() -> None:
             ),
             timeout=0,
         )
+
+
+def test_bus_buffers_non_matching_responses_for_later_callers() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    bus = Pybus(transport=transport, serializer=serializer)
+    reply_queue = "billing.replies"
+
+    first_response = ResponseMessage(
+        message_type="billing.get_invoice.response",
+        payload={"invoice_id": "INV-2", "total": 200},
+        correlation_id="corr-2",
+        reply_to=reply_queue,
+    ).to_envelope(message_id="resp-2")
+    second_response = ResponseMessage(
+        message_type="billing.get_invoice.response",
+        payload={"invoice_id": "INV-1", "total": 100},
+        correlation_id="corr-1",
+        reply_to=reply_queue,
+    ).to_envelope(message_id="resp-1")
+
+    transport.publish(reply_queue, serializer.dump(first_response))
+    transport.publish(reply_queue, serializer.dump(second_response))
+
+    received = bus._await_response("corr-1", timeout=1, reply_queue=reply_queue)
+    buffered = bus.coordinator.take_response("corr-2")
+
+    assert received.correlation_id == "corr-1"
+    assert buffered is not None
+    assert buffered.correlation_id == "corr-2"
+    assert transport.size(reply_queue) == 0
+
+
+def test_bus_request_honors_subsecond_timeout() -> None:
+    bus = Pybus(transport=MemoryTransport(), serializer=JsonSerializer())
+
+    started_at = time.monotonic()
+    with pytest.raises(MessageTimeoutError):
+        bus.request(
+            RequestMessage(
+                message_type="billing.get_invoice",
+                payload={"invoice_id": "INV-1"},
+                correlation_id="corr-short-timeout",
+            ),
+            timeout=0.1,
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.5
