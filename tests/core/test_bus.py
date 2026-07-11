@@ -17,6 +17,17 @@ from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
 
 
+class PublishFailureTransport(MemoryTransport):
+    def __init__(self, *, fail_channel: str) -> None:
+        super().__init__()
+        self.fail_channel = fail_channel
+
+    def publish(self, channel: str, message: bytes) -> None:
+        if channel == self.fail_channel:
+            raise RuntimeError(f"failed to publish to {channel}")
+        super().publish(channel, message)
+
+
 def test_listener_publishes_response_for_request_handlers() -> None:
     registry = Registry()
     transport = MemoryTransport()
@@ -53,6 +64,40 @@ def test_listener_publishes_response_for_request_handlers() -> None:
     assert response_envelope.correlation_id == request_envelope.correlation_id
     assert response_envelope.causation_id == request_envelope.message_id
     assert response_envelope.reply_to == DEFAULT_REPLY_QUEUE
+
+
+def test_listener_does_not_retry_processed_request_when_response_publish_fails() -> (
+    None
+):
+    registry = Registry()
+    transport = PublishFailureTransport(fail_channel=DEFAULT_REPLY_QUEUE)
+    serializer = JsonSerializer()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport, dispatcher=dispatcher, serializer=serializer
+    )
+
+    def handle_invoice_request(message: RequestMessage) -> ResponseMessage:
+        return ResponseMessage(
+            message_type="billing.get_invoice.response",
+            payload={"invoice_id": message.payload["invoice_id"], "total": 100},
+        )
+
+    registry.register("request", "billing.get_invoice", handle_invoice_request)
+
+    request_envelope = RequestMessage(
+        message_type="billing.get_invoice",
+        payload={"invoice_id": "INV-1"},
+    ).to_envelope(message_id="req-1")
+
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(request_envelope))
+
+    with pytest.raises(RuntimeError, match="failed to publish"):
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert transport.size(DEFAULT_QUEUE_NAME) == 0
+    assert transport.size(DEFAULT_REPLY_QUEUE) == 0
+    assert transport.size(listener.dead_letter_channel) == 0
 
 
 def test_bus_request_waits_for_matching_response() -> None:

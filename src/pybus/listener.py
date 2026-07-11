@@ -43,19 +43,21 @@ class Listener:
 
         try:
             result = self.dispatcher.dispatch(envelope)
-            if envelope.message_kind == RequestMessage.message_kind and isinstance(
-                result, ResponseMessage
-            ):
-                self._publish_response(envelope, result)
-            return result
         except HandlerNotFoundError:
             self._dead_letter(channel_name, envelope)
+            return None
         except Exception:
             if self._should_retry(envelope):
                 self._requeue(channel_name, envelope)
             else:
                 self._dead_letter(channel_name, envelope)
-        return None
+            return None
+
+        if envelope.message_kind == RequestMessage.message_kind and isinstance(
+            result, ResponseMessage
+        ):
+            self._publish_response(envelope, result)
+        return result
 
     def listen(
         self,
