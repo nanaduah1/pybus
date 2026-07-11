@@ -1,4 +1,12 @@
 from pybus.contracts import InboxStore, OutboxStore, Transport
+from pybus.bus import (
+    Pybus,
+    configure_transport,
+    get_bus,
+    publish_event,
+    request,
+    send_command,
+)
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.listener import Listener
@@ -28,18 +36,24 @@ __all__ = [
     "DEFAULT_QUEUE_NAME",
     "DEFAULT_QUEUE_TOPOLOGY",
     "DEFAULT_SLOW_QUEUE_NAME",
+    "Pybus",
+    "configure_transport",
     "Dispatcher",
     "EventMessage",
     "InboxStore",
     "JsonSerializer",
+    "get_bus",
     "Listener",
     "MessageEnvelope",
     "OutboxStore",
     "QueueTopology",
     "Registry",
+    "publish_event",
     "RequestMessage",
     "ResponseMessage",
+    "request",
     "declare_queue",
     "declare_queues",
+    "send_command",
     "Transport",
 ]
