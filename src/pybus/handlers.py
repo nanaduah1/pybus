@@ -131,15 +131,37 @@ def request_handler(
     )
 
 
-def register_handlers(registry: Registry, *targets: object) -> tuple[Handler, ...]:
+def _resolve_registry(
+    targets: tuple[object, ...],
+    registry: Registry | None,
+) -> tuple[Registry, tuple[object, ...]]:
+    if registry is not None:
+        return registry, targets
+
+    if targets and isinstance(targets[0], Registry):
+        return targets[0], targets[1:]
+
+    from pybus.bus import get_bus
+
+    return get_bus().dispatcher.registry, targets
+
+
+def register_handlers(
+    *targets: object,
+    registry: Registry | None = None,
+) -> tuple[Handler, ...]:
+    resolved_registry, resolved_targets = _resolve_registry(targets, registry)
     registered: list[Handler] = []
-    for target in targets:
-        registered.extend(_register_target_handlers(registry, target))
+    for target in resolved_targets:
+        registered.extend(_register_target_handlers(resolved_registry, target))
     return tuple(registered)
 
 
-def bind_handlers(registry: Registry, *targets: object) -> tuple[Handler, ...]:
-    return register_handlers(registry, *targets)
+def bind_handlers(
+    *targets: object,
+    registry: Registry | None = None,
+) -> tuple[Handler, ...]:
+    return register_handlers(*targets, registry=registry)
 
 
 def _register_target_handlers(registry: Registry, target: object) -> list[Handler]:

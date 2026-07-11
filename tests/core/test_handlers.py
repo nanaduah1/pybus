@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 import pybus
+from pybus.bus import configure_transport, get_bus
 from pybus.dispatcher import Dispatcher
 from pybus.handlers import (
     bind_handlers,
@@ -14,6 +15,7 @@ from pybus.handlers import (
 from pybus.messages import CommandMessage, EventMessage, RequestMessage
 from pybus.registry import Registry
 from pybus.serializer import JsonSerializer
+from pybus.transports.memory import MemoryTransport
 
 
 def test_handler_helpers_are_exposed_from_package_root() -> None:
@@ -144,3 +146,27 @@ def test_handlers_can_bind_to_message_classes() -> None:
     assert event_result == "payment-confirmed"
     assert command_result == "bill-generated"
     assert received == [("event", "PAY-1"), ("command", "S-3")]
+
+
+def test_bind_handlers_uses_default_bus_registry_when_registry_is_omitted() -> None:
+    bus = configure_transport(MemoryTransport())
+    received: list[str] = []
+
+    class StudentHandlers:
+        @event_handler("student.enrolled")
+        def handle_enrolled(self, message: EventMessage) -> str:
+            received.append(message.payload["student_id"])
+            return "handled"
+
+    registered = bind_handlers(StudentHandlers())
+    result = get_bus().dispatcher.dispatch(
+        EventMessage(
+            message_type="student.enrolled",
+            payload={"student_id": "S-4"},
+        ).to_envelope(message_id="msg-6")
+    )
+
+    assert bus is get_bus()
+    assert len(registered) == 1
+    assert result == "handled"
+    assert received == ["S-4"]
