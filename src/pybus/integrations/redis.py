@@ -63,9 +63,8 @@ class RedisTransport:
 def decode_legacy_redis_payload(payload: bytes | str) -> Any:
     """Decode a Redis payload that may still be JSON or legacy pickle."""
 
-    serializer = JsonSerializer()
     try:
-        return serializer.loads(payload)
+        return decode_json_redis_payload(payload)
     except DeserializationError:
         raw = payload.encode("utf-8") if isinstance(payload, str) else payload
         try:
@@ -74,3 +73,23 @@ def decode_legacy_redis_payload(payload: bytes | str) -> Any:
             raise DeserializationError(
                 "Payload is not valid JSON or legacy pickle"
             ) from exc
+
+
+def decode_json_redis_payload(payload: bytes | str) -> Any:
+    """Decode a Redis payload as JSON only."""
+
+    serializer = JsonSerializer()
+    return serializer.loads(payload)
+
+
+def decode_trusted_legacy_redis_payload(payload: bytes | str) -> Any:
+    """Decode trusted migration payloads that may be JSON or legacy pickle."""
+    return decode_legacy_redis_payload(payload)
+
+
+__all__ = [
+    "RedisTransport",
+    "decode_json_redis_payload",
+    "decode_legacy_redis_payload",
+    "decode_trusted_legacy_redis_payload",
+]

@@ -19,7 +19,10 @@ from pybus.messages import (
 )
 from pybus.contracts import Transport
 from pybus.queues import QueueTopology
-from pybus.request_response import DEFAULT_REPLY_QUEUE, RequestResponseCoordinator
+from pybus.request_response import (
+    RequestResponseCoordinator,
+    default_reply_queue_name,
+)
 from pybus.serializer import JsonSerializer
 
 
@@ -31,6 +34,7 @@ class Pybus:
     topology: QueueTopology
     listener: Listener
     coordinator: RequestResponseCoordinator
+    reply_queue: str
 
     def __init__(
         self,
@@ -52,6 +56,7 @@ class Pybus:
             dead_letter_channel=self.topology.dead_letter_queue,
         )
         self.coordinator = RequestResponseCoordinator()
+        self.reply_queue = default_reply_queue_name()
         if handler_targets:
             from pybus.handlers import register_handlers
 
@@ -82,7 +87,7 @@ class Pybus:
         reply_to: str | None = None,
     ) -> ResponseMessage:
         request_queue = queue or self.topology.default_queue
-        reply_queue = reply_to or request.reply_to or DEFAULT_REPLY_QUEUE
+        reply_queue = reply_to or request.reply_to or self.reply_queue
         request_envelope, ticket = self.coordinator.prepare_request(
             request,
             timeout=timeout,

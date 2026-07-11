@@ -19,6 +19,7 @@ from pybus.serializer import JsonSerializer
 DEFAULT_QUEUE_NAME = _DEFAULT_QUEUE_NAME
 DEFAULT_SLOW_QUEUE_NAME = _DEFAULT_SLOW_QUEUE_NAME
 DEFAULT_FAILED_QUEUE_NAME = _DEFAULT_FAILED_QUEUE_NAME
+MULTI_QUEUE_CONSUME_TIMEOUT = 1
 
 
 class Listener:
@@ -79,8 +80,9 @@ class Listener:
         self, channel: str | Sequence[str]
     ) -> tuple[str | None, MessageEnvelope | None]:
         channels = (channel,) if isinstance(channel, str) else tuple(channel)
+        consume_timeout = 5 if len(channels) == 1 else MULTI_QUEUE_CONSUME_TIMEOUT
         for channel_name in channels:
-            raw_message = self.transport.consume(channel_name)
+            raw_message = self.transport.consume(channel_name, timeout=consume_timeout)
             if raw_message is None:
                 continue
             envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))

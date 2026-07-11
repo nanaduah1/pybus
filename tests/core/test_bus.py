@@ -144,6 +144,46 @@ def test_bus_request_waits_for_matching_response() -> None:
     assert worker.is_alive() is False
 
 
+def test_bus_instances_use_distinct_default_reply_queues() -> None:
+    shared_transport = MemoryTransport()
+
+    first_bus = Pybus(transport=shared_transport, serializer=JsonSerializer())
+    second_bus = Pybus(transport=shared_transport, serializer=JsonSerializer())
+
+    assert first_bus.reply_queue != second_bus.reply_queue
+
+
+def test_bus_request_does_not_consume_another_bus_reply_queue() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    first_bus = Pybus(transport=transport, serializer=serializer)
+    second_bus = Pybus(transport=transport, serializer=serializer)
+
+    foreign_response = ResponseMessage(
+        message_type="billing.get_invoice.response",
+        payload={"invoice_id": "INV-2", "total": 200},
+        correlation_id="corr-foreign",
+        reply_to=second_bus.reply_queue,
+    ).to_envelope(message_id="resp-foreign")
+    transport.publish(second_bus.reply_queue, serializer.dump(foreign_response))
+
+    with pytest.raises(MessageTimeoutError):
+        first_bus.request(
+            RequestMessage(
+                message_type="billing.get_invoice",
+                payload={"invoice_id": "INV-1"},
+                correlation_id="corr-local",
+            ),
+            timeout=0.05,
+        )
+
+    assert transport.size(second_bus.reply_queue) == 1
+    buffered = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(second_bus.reply_queue))
+    )
+    assert buffered.correlation_id == "corr-foreign"
+
+
 def test_bus_request_times_out_when_no_response_arrives() -> None:
     bus = Pybus(transport=MemoryTransport(), serializer=JsonSerializer())
 

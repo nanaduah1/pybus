@@ -10,6 +10,16 @@ from pybus.transports.memory import MemoryTransport
 from pybus.retries import RetryPolicy
 
 
+class RecordingTransport(MemoryTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.consume_calls: list[tuple[str, int]] = []
+
+    def consume(self, channel: str, timeout: int = 5) -> bytes | None:
+        self.consume_calls.append((channel, timeout))
+        return super().consume(channel, timeout=timeout)
+
+
 def test_listener_retries_failed_message_before_dead_letter() -> None:
     registry = Registry()
     transport = MemoryTransport()
@@ -61,7 +71,7 @@ def test_listener_retries_failed_message_before_dead_letter() -> None:
 
 
 def test_listener_consumes_first_available_channel_from_sequence() -> None:
-    transport = MemoryTransport()
+    transport = RecordingTransport()
     serializer = JsonSerializer()
     registry = Registry()
     dispatcher = Dispatcher(registry=registry, serializer=serializer)
@@ -88,3 +98,14 @@ def test_listener_consumes_first_available_channel_from_sequence() -> None:
 
     assert result == "ok"
     assert received == ["student.enrolled"]
+    assert transport.consume_calls == [("queue.zero", 1), ("queue.one", 1)]
+
+
+def test_listener_blocks_boundedly_when_sequence_is_empty() -> None:
+    transport = RecordingTransport()
+    listener = Listener(transport=transport, serializer=JsonSerializer())
+
+    result = listener.listen_once(("queue.zero", "queue.one"))
+
+    assert result is None
+    assert transport.consume_calls == [("queue.zero", 1), ("queue.one", 1)]

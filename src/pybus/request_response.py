@@ -12,6 +12,10 @@ from pybus.messages import RequestMessage, ResponseMessage
 DEFAULT_REPLY_QUEUE = "pybus.responses"
 
 
+def default_reply_queue_name() -> str:
+    return f"{DEFAULT_REPLY_QUEUE}.{uuid4()}"
+
+
 @dataclass(frozen=True)
 class RequestTicket:
     correlation_id: str
@@ -123,3 +127,11 @@ class RequestResponseCoordinator:
                 self._condition.wait(timeout=remaining)
 
             return self._responses.pop(correlation_id)
+
+
+__all__ = [
+    "DEFAULT_REPLY_QUEUE",
+    "RequestResponseCoordinator",
+    "RequestTicket",
+    "default_reply_queue_name",
+]
