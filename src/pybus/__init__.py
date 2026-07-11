@@ -9,6 +9,14 @@ from pybus.bus import (
 )
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
+from pybus.handlers import (
+    HandlerSpec,
+    bind_handlers,
+    command_handler,
+    event_handler,
+    register_handlers,
+    request_handler,
+)
 from pybus.listener import Listener
 from pybus.messages import (
     BaseMessage,
@@ -43,6 +51,10 @@ __all__ = [
     "InboxStore",
     "JsonSerializer",
     "get_bus",
+    "HandlerSpec",
+    "bind_handlers",
+    "command_handler",
+    "event_handler",
     "Listener",
     "MessageEnvelope",
     "OutboxStore",
@@ -52,6 +64,8 @@ __all__ = [
     "RequestMessage",
     "ResponseMessage",
     "request",
+    "register_handlers",
+    "request_handler",
     "declare_queue",
     "declare_queues",
     "send_command",
