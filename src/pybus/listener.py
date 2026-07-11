@@ -79,8 +79,9 @@ class Listener:
         self, channel: str | Sequence[str]
     ) -> tuple[str | None, MessageEnvelope | None]:
         channels = (channel,) if isinstance(channel, str) else tuple(channel)
+        consume_timeout = 5 if len(channels) == 1 else 0
         for channel_name in channels:
-            raw_message = self.transport.consume(channel_name)
+            raw_message = self.transport.consume(channel_name, timeout=consume_timeout)
             if raw_message is None:
                 continue
             envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))
