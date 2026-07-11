@@ -95,6 +95,10 @@ class RequestResponseCoordinator:
             self._responses[response_envelope.correlation_id] = response_envelope
             self._condition.notify_all()
 
+    def take_response(self, correlation_id: str) -> MessageEnvelope | None:
+        with self._condition:
+            return self._responses.pop(correlation_id, None)
+
     def wait_for_response(
         self,
         correlation_id: str,

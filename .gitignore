@@ -1,0 +1,16 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.poetry-cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local dependency lockfile for this library repo
+poetry.lock

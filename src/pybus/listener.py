@@ -6,11 +6,13 @@ from datetime import datetime, timezone
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import HandlerNotFoundError
+from pybus.messages import RequestMessage, ResponseMessage
 from pybus.queues import (
     DEFAULT_FAILED_QUEUE_NAME as _DEFAULT_FAILED_QUEUE_NAME,
     DEFAULT_QUEUE_NAME as _DEFAULT_QUEUE_NAME,
     DEFAULT_SLOW_QUEUE_NAME as _DEFAULT_SLOW_QUEUE_NAME,
 )
+from pybus.request_response import DEFAULT_REPLY_QUEUE
 from pybus.retries import RetryPolicy, next_retry_payload
 from pybus.serializer import JsonSerializer
 
@@ -40,15 +42,22 @@ class Listener:
             return None
 
         try:
-            return self.dispatcher.dispatch(envelope)
+            result = self.dispatcher.dispatch(envelope)
         except HandlerNotFoundError:
             self._dead_letter(channel_name, envelope)
+            return None
         except Exception:
             if self._should_retry(envelope):
                 self._requeue(channel_name, envelope)
             else:
                 self._dead_letter(channel_name, envelope)
-        return None
+            return None
+
+        if envelope.message_kind == RequestMessage.message_kind and isinstance(
+            result, ResponseMessage
+        ):
+            self._publish_response(envelope, result)
+        return result
 
     def listen(
         self,
@@ -144,3 +153,25 @@ class Listener:
                 )
             ),
         )
+
+    def _publish_response(
+        self,
+        request_envelope: MessageEnvelope,
+        response: ResponseMessage,
+    ) -> None:
+        reply_queue = request_envelope.reply_to or DEFAULT_REPLY_QUEUE
+        response_envelope = MessageEnvelope.create(
+            message_type=response.message_type,
+            message_kind=response.message_kind,
+            version=response.version,
+            payload=response.payload,
+            headers=response.headers,
+            created_at=datetime.now(timezone.utc),
+            correlation_id=request_envelope.correlation_id,
+            causation_id=request_envelope.message_id,
+            reply_to=reply_queue,
+            expires_at=response.expires_at,
+            content_type=response.content_type,
+            content_encoding=response.content_encoding,
+        )
+        self.transport.publish(reply_queue, self.serializer.dump(response_envelope))
