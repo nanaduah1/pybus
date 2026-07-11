@@ -362,9 +362,9 @@ Exception names may evolve, but their semantics must remain stable.
 The following defaults should remain stable unless a versioned breaking change
 is intentionally introduced:
 
-- default queue name: `skuulbe.jobs`
-- dead-letter queue name: `skuulbe.jobs.failed`
-- slow queue name: `skuulbe.jobs.slow`
+- default queue name: `pybus.jobs`
+- dead-letter queue name: `pybus.jobs.failed`
+- slow queue name: `pybus.jobs.slow`
 - default retry limit: `10`
 - default batched handler size: `100`
 - default batched max wait: `10`
@@ -372,4 +372,5 @@ is intentionally introduced:
 - Redis as the first reference transport extra
 - Django as the first reference framework extra
 
-These defaults are currently aligned with the existing monolith behavior.
+Applications may override those queue-role names for compatibility with an
+existing deployment such as `skuulbe.jobs`.

@@ -10,7 +10,8 @@ from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import MessageTimeoutError
 from pybus.listener import DEFAULT_QUEUE_NAME, Listener
-from pybus.messages import RequestMessage, ResponseMessage
+from pybus.messages import EventMessage, RequestMessage, ResponseMessage
+from pybus.queues import QueueTopology
 from pybus.registry import Registry
 from pybus.request_response import DEFAULT_REPLY_QUEUE
 from pybus.serializer import JsonSerializer
@@ -204,3 +205,24 @@ def test_bus_request_honors_subsecond_timeout() -> None:
     elapsed = time.monotonic() - started_at
 
     assert elapsed < 0.5
+
+
+def test_bus_can_route_through_app_mapped_default_queue() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    topology = QueueTopology().with_queue_names(
+        default_queue="skuulbe.jobs",
+        slow_queue="skuulbe.jobs.slow",
+        dead_letter_queue="skuulbe.jobs.failed",
+    )
+    bus = Pybus(transport=transport, serializer=serializer, topology=topology)
+
+    envelope = bus.publish_event(
+        EventMessage(
+            message_type="student.enrolled",
+            payload={"student_id": "S-1"},
+        )
+    )
+
+    assert envelope.message_type == "student.enrolled"
+    assert transport.size("skuulbe.jobs") == 1
