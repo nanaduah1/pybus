@@ -101,3 +101,46 @@ def test_duplicate_command_registration_is_rejected() -> None:
 
     with pytest.raises(ValueError):
         register_handlers(registry, DuplicateCommandHandlers())
+
+
+def test_handlers_can_bind_to_message_classes() -> None:
+    registry = Registry()
+    dispatcher = Dispatcher(registry=registry, serializer=JsonSerializer())
+    received: list[tuple[str, str]] = []
+
+    class PaymentConfirmedEvent(EventMessage):
+        message_type = "billing.payment_confirmed"
+
+    class GenerateStudentBill(CommandMessage):
+        message_type = "billing.generate_student_bill"
+
+    class BillingHandlers:
+        @event_handler(PaymentConfirmedEvent)
+        def handle_payment_confirmed(self, message: EventMessage) -> str:
+            received.append(("event", message.payload["payment_id"]))
+            return "payment-confirmed"
+
+        @command_handler(GenerateStudentBill)
+        def handle_generate_student_bill(self, message: CommandMessage) -> str:
+            received.append(("command", message.payload["student_id"]))
+            return "bill-generated"
+
+    registered = register_handlers(registry, BillingHandlers())
+
+    event_result = dispatcher.dispatch(
+        EventMessage(
+            message_type="billing.payment_confirmed",
+            payload={"payment_id": "PAY-1"},
+        ).to_envelope(message_id="msg-4")
+    )
+    command_result = dispatcher.dispatch(
+        CommandMessage(
+            message_type="billing.generate_student_bill",
+            payload={"student_id": "S-3"},
+        ).to_envelope(message_id="msg-5")
+    )
+
+    assert len(registered) == 2
+    assert event_result == "payment-confirmed"
+    assert command_result == "bill-generated"
+    assert received == [("event", "PAY-1"), ("command", "S-3")]

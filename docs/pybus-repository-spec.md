@@ -361,17 +361,17 @@ class StudentEnrolled(EventMessage):
 from pybus.handlers import event_handler, command_handler, request_handler
 
 
-@event_handler("student.enrolled")
+@event_handler(StudentEnrolled)
 def on_student_enrolled(message):
     ...
 
 
-@command_handler("billing.generate_student_bill")
+@command_handler(GenerateStudentBill)
 def handle_generate_student_bill(command):
     ...
 
 
-@request_handler("billing.get_invoice")
+@request_handler(GetInvoice)
 def handle_get_invoice(request):
     return InvoiceResponse(...)
 ```
