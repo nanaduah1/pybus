@@ -25,3 +25,10 @@ class MemoryTransport:
 
     def size(self, channel: str) -> int:
         return len(self._queues[channel])
+
+    def consume_many(self, channel: str, limit: int) -> list[bytes]:
+        queue = self._queues[channel]
+        items: list[bytes] = []
+        while queue and len(items) < limit:
+            items.append(queue.popleft())
+        return items

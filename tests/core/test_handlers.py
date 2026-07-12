@@ -6,6 +6,8 @@ import pybus
 from pybus.bus import configure_transport, get_bus
 from pybus.dispatcher import Dispatcher
 from pybus.handlers import (
+    ContinueProcessing,
+    batched_event_handler,
     bind_handlers,
     command_handler,
     event_handler,
@@ -20,10 +22,12 @@ from pybus.transports.memory import MemoryTransport
 
 def test_handler_helpers_are_exposed_from_package_root() -> None:
     assert pybus.event_handler is event_handler
+    assert pybus.batched_event_handler is batched_event_handler
     assert pybus.command_handler is command_handler
     assert pybus.request_handler is request_handler
     assert pybus.register_handlers is register_handlers
     assert pybus.bind_handlers is bind_handlers
+    assert pybus.ContinueProcessing is ContinueProcessing
 
 
 def test_event_handlers_register_and_fan_out_from_a_handler_object() -> None:
@@ -196,3 +200,19 @@ def test_configure_transport_can_wire_handler_targets_without_manual_binding() -
     assert bus is get_bus()
     assert result == "handled-by-bootstrap"
     assert received == ["S-5"]
+
+
+def test_batched_event_handler_marks_handler_metadata() -> None:
+    class StudentHandlers:
+        @batched_event_handler("student.enrolled", batch_size=25, max_wait=30)
+        def handle_enrolled_batch(self, messages: list[EventMessage]) -> None:
+            return None
+
+    handler = StudentHandlers().handle_enrolled_batch
+    spec = getattr(handler.__func__, "__pybus_handler_spec__")
+
+    assert spec.message_kind == "event"
+    assert spec.message_type == "student.enrolled"
+    assert spec.is_batched is True
+    assert spec.batch_size == 25
+    assert spec.max_wait == 30

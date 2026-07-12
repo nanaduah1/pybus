@@ -15,6 +15,16 @@ class HandlerSpec:
     message_kind: str
     message_type: str
     allow_multiple: bool | None = None
+    retry_limit: int | None = None
+    delay: int = 0
+    is_batched: bool = False
+    batch_size: int = 100
+    max_wait: int = 10
+
+
+@dataclass(frozen=True, slots=True)
+class ContinueProcessing:
+    queue: str | None = None
 
 
 MessageBinding = str | type[BaseMessage]
@@ -63,6 +73,11 @@ def _decorate_handler(
     message: MessageBinding,
     *,
     allow_multiple: bool | None = None,
+    retry_limit: int | None = None,
+    delay: int = 0,
+    is_batched: bool = False,
+    batch_size: int = 100,
+    max_wait: int = 10,
     registry: Registry | None = None,
 ) -> Callable[[Handler], Handler]:
     resolved_kind, resolved_type = _resolve_message_binding(
@@ -73,6 +88,11 @@ def _decorate_handler(
         message_kind=resolved_kind,
         message_type=resolved_type,
         allow_multiple=allow_multiple,
+        retry_limit=retry_limit,
+        delay=delay,
+        is_batched=is_batched,
+        batch_size=batch_size,
+        max_wait=max_wait,
     )
 
     def decorator(handler: Handler) -> Handler:
@@ -93,12 +113,36 @@ def event_handler(
     message: MessageBinding,
     *,
     allow_multiple: bool | None = None,
+    retry_limit: int | None = None,
+    delay: int = 0,
     registry: Registry | None = None,
 ) -> Callable[[Handler], Handler]:
     return _decorate_handler(
         "event",
         message,
         allow_multiple=allow_multiple,
+        retry_limit=retry_limit,
+        delay=delay,
+        registry=registry,
+    )
+
+
+def batched_event_handler(
+    message: MessageBinding,
+    *,
+    batch_size: int = 100,
+    max_wait: int = 10,
+    retry_limit: int | None = None,
+    registry: Registry | None = None,
+) -> Callable[[Handler], Handler]:
+    return _decorate_handler(
+        "event",
+        message,
+        allow_multiple=True,
+        retry_limit=retry_limit,
+        is_batched=True,
+        batch_size=batch_size,
+        max_wait=max_wait,
         registry=registry,
     )
 
@@ -195,7 +239,9 @@ def _register_target_handlers(registry: Registry, target: object) -> list[Handle
 __all__ = [
     "HandlerSpec",
     "bind_handlers",
+    "batched_event_handler",
     "command_handler",
+    "ContinueProcessing",
     "event_handler",
     "register_handlers",
     "request_handler",
