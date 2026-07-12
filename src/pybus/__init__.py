@@ -10,7 +10,9 @@ from pybus.bus import (
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.handlers import (
+    ContinueProcessing,
     HandlerSpec,
+    batched_event_handler,
     bind_handlers,
     command_handler,
     event_handler,
@@ -36,6 +38,15 @@ from pybus.queues import (
     declare_queues,
 )
 from pybus.serializer import JsonSerializer
+from pybus.scheduling import (
+    InMemoryScheduleStateStore,
+    ScheduleStateStore,
+    ScheduledTask,
+    Scheduler,
+    configure_scheduler,
+    get_scheduler,
+    scheduled,
+)
 
 __all__ = [
     "BaseMessage",
@@ -51,7 +62,9 @@ __all__ = [
     "InboxStore",
     "JsonSerializer",
     "get_bus",
+    "ContinueProcessing",
     "HandlerSpec",
+    "batched_event_handler",
     "bind_handlers",
     "command_handler",
     "event_handler",
@@ -66,6 +79,13 @@ __all__ = [
     "request",
     "register_handlers",
     "request_handler",
+    "configure_scheduler",
+    "get_scheduler",
+    "ScheduleStateStore",
+    "ScheduledTask",
+    "Scheduler",
+    "scheduled",
+    "InMemoryScheduleStateStore",
     "declare_queue",
     "declare_queues",
     "send_command",

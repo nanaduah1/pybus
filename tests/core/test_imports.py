@@ -13,3 +13,6 @@ def test_pybus_imports():
     assert pybus.event_handler is not None
     assert pybus.command_handler is not None
     assert pybus.request_handler is not None
+    assert pybus.configure_scheduler is not None
+    assert pybus.get_scheduler is not None
+    assert pybus.scheduled is not None

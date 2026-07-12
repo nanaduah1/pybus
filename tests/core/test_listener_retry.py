@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
+from pybus.handlers import ContinueProcessing, batched_event_handler, event_handler
 from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME, Listener
 from pybus.messages import EventMessage
 from pybus.registry import Registry
+from pybus.retries import RetryPolicy
 from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
-from pybus.retries import RetryPolicy
 
 
 class RecordingTransport(MemoryTransport):
@@ -109,3 +112,106 @@ def test_listener_blocks_boundedly_when_sequence_is_empty() -> None:
 
     assert result is None
     assert transport.consume_calls == [("queue.zero", 1), ("queue.one", 1)]
+
+
+def test_listener_requeues_continuation_on_same_queue() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+    )
+    handled: list[str] = []
+
+    @event_handler("billing.chunked")
+    def handle_event(message: EventMessage) -> ContinueProcessing:
+        handled.append(message.payload["batch_id"])
+        return ContinueProcessing()
+
+    registry.register("event", "billing.chunked", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="billing.chunked",
+                payload={"batch_id": "B-1"},
+            ).to_envelope(message_id="msg-cont")
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert handled == ["B-1"]
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_listener_flushes_batched_handlers_by_size() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+    )
+    flushed: list[list[str]] = []
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=30)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        flushed.append([message.payload["entry"] for message in messages])
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    for entry in ("one", "two"):
+        transport.publish(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="audit.log",
+                    payload={"entry": entry},
+                ).to_envelope()
+            ),
+        )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert flushed == [["one", "two"]]
+    assert transport.size("batched:audit.log") == 0
+
+
+def test_listener_flushes_batched_handlers_after_max_wait() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+    )
+    flushed: list[list[str]] = []
+
+    @batched_event_handler("audit.log", batch_size=10, max_wait=5)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        flushed.append([message.payload["entry"] for message in messages])
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log",
+                payload={"entry": "late"},
+            ).to_envelope()
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    listener._batch_started_at["audit.log"] = datetime.now(timezone.utc) - timedelta(
+        seconds=6
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert flushed == [["late"]]

@@ -51,6 +51,17 @@ class RedisTransport:
         _, message = result
         return message
 
+    def size(self, channel: str) -> int:
+        return int(self._client.llen(channel))
+
+    def consume_many(self, channel: str, limit: int) -> list[bytes]:
+        lua_pop = """
+        local res = redis.call('LRANGE', KEYS[1], 0, ARGV[1] - 1)
+        redis.call('LTRIM', KEYS[1], ARGV[1], -1)
+        return res
+        """
+        return list(self._client.eval(lua_pop, 1, channel, limit))
+
     def ack(self, receipt: str) -> None:
         """Ack is a no-op for the list-based transport."""
         return None
