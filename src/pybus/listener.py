@@ -212,9 +212,11 @@ class Listener:
                     message_type,
                     datetime.now(timezone.utc),
                 )
-                ready = buffer_size >= spec.batch_size or (
-                    datetime.now(timezone.utc) - started_at
-                ).total_seconds() >= spec.max_wait
+                ready = (
+                    buffer_size >= spec.batch_size
+                    or (datetime.now(timezone.utc) - started_at).total_seconds()
+                    >= spec.max_wait
+                )
                 if ready:
                     self._flush_batch(message_type, handler, spec)
 

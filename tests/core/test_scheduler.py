@@ -75,7 +75,9 @@ def test_run_due_tasks_executes_and_reschedules_interval_task() -> None:
     assert calls == ["ran"]
     assert task.last_run == current
     assert task.due == current + timedelta(seconds=120)
-    assert state_store.get("pybus.scheduler.last_run:send_digest") == current.isoformat()
+    assert (
+        state_store.get("pybus.scheduler.last_run:send_digest") == current.isoformat()
+    )
 
 
 def test_run_due_tasks_applies_backoff_after_failure() -> None:

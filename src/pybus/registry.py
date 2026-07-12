@@ -56,6 +56,4 @@ class Registry:
         return bool(self.handlers_for(message_kind, message_type))
 
     def items(self) -> tuple[tuple[tuple[str, str], tuple[Handler, ...]], ...]:
-        return tuple(
-            (key, tuple(handlers)) for key, handlers in self._handlers.items()
-        )
+        return tuple((key, tuple(handlers)) for key, handlers in self._handlers.items())
