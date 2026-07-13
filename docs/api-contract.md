@@ -109,6 +109,58 @@ Allowed payload value types:
 The framework must provide a documented encoding strategy for non-primitive
 types.
 
+### 2.5 Payload codecs
+
+Applications configure one payload codec on `Pybus` / `configure_transport`.
+The same codec applies to event, command, request, and response payloads and
+headers, including listener and retry paths.
+
+The core `PythonPayloadCodec` supports the normal JSON-compatible values plus:
+
+- datetime/date/time and UUID values
+- `Decimal` without float conversion
+- registered Python dataclasses
+
+Dataclasses are encoded inline with a fully qualified type identifier, schema
+version, and recursively encoded fields:
+
+```json
+{
+  "__pybus_codec__": "dataclass",
+  "type": "reports.descriptors:ReportDescriptor",
+  "version": 1,
+  "fields": {}
+}
+```
+
+Inline metadata is required because nested values may have different types.
+Envelope headers may additionally describe the top-level schema, but are not a
+replacement for nested metadata.
+
+`__pybus_codec__` is the versioned namespace for codec-owned values. Unknown
+codec types and versions fail deserialization. Known legacy `__pybus_type__`
+encodings remain readable during migration; unknown legacy marker values are
+ordinary application JSON and round-trip unchanged.
+Application mappings containing `__pybus_codec__` are encoded through a
+versioned mapping wrapper, including when nested, so the reserved codec key
+cannot collide with ordinary payload data. Framework retry and dead-letter
+metadata added to the wrapper remains visible after the application mapping is
+decoded.
+
+Producers and consumers must register allowed dataclass types through
+`PayloadTypeRegistry`.
+Unknown types fail deserialization; the framework never imports arbitrary
+classes named by message data. Registry aliases provide an explicit migration
+path when a class moves modules.
+
+Framework integrations extend this contract by composition. The Django codec
+adds model references such as `django://schools/student` and delegates all
+generic Python values to `PythonPayloadCodec`. Django model identifiers are an
+explicit allowlist: each identifier requires an application-supplied resolver,
+which receives the decoded envelope headers and is responsible for tenant-aware
+lookup. The codec never uses an unscoped default model manager, and a resolver
+returning `None` fails deserialization.
+
 ---
 
 ## 3. Event Contract

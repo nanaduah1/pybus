@@ -1,26 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import fields, is_dataclass
-from decimal import Decimal
+from collections.abc import Iterable, Mapping
 from importlib import import_module
-from typing import Any
+from typing import Any, Callable
 
-from pybus._codec import decode_value, encode_value
-from pybus.exceptions import DeserializationError
+from pybus.codecs import (
+    CODEC_KEY,
+    CODEC_VERSION,
+    TYPE_KEY,
+    PayloadTypeRegistry,
+    PythonPayloadCodec,
+    _validate_codec_version,
+)
+from pybus.exceptions import DeserializationError, SerializationError
 from pybus.serializer import JsonSerializer
 
 
-_TYPE_KEY = "__pybus_type__"
 _MODEL_TYPE = "django_model"
-_DECIMAL_TYPE = "decimal"
-_DATACLASS_TYPE = "dataclass"
-
-
-def _resolve_qualname(module_name: str, qualname: str) -> Any:
-    value = import_module(module_name)
-    for part in qualname.split("."):
-        value = getattr(value, part)
-    return value
+_DJANGO_TYPE_PREFIX = "django://"
 
 
 def _django_model_base() -> type[Any] | None:
@@ -31,110 +28,144 @@ def _django_model_base() -> type[Any] | None:
     return getattr(models_module, "Model", None)
 
 
-def _django_apps_registry() -> Any:
-    return import_module("django.apps").apps
+class DjangoPayloadCodec(PythonPayloadCodec):
+    """Extend the generic Python codec with Django model references."""
+
+    def __init__(
+        self,
+        *,
+        type_registry: PayloadTypeRegistry | Iterable[type[Any]] | None = None,
+        model_resolvers: Mapping[str, Callable[[Any, Mapping[str, Any]], Any]]
+        | None = None,
+    ) -> None:
+        super().__init__(type_registry=type_registry)
+        self.model_resolvers = dict(model_resolvers or {})
+
+    def encode(self, value: Any, *, context: Mapping[str, Any] | None = None) -> Any:
+        model_base = _django_model_base()
+        if model_base is not None and isinstance(value, model_base):
+            model_type = (
+                f"{_DJANGO_TYPE_PREFIX}{value._meta.app_label}/{value._meta.model_name}"
+            )
+            if model_type not in self.model_resolvers:
+                raise SerializationError(
+                    f"Django model type {model_type!r} has no configured resolver"
+                )
+            return {
+                CODEC_KEY: _MODEL_TYPE,
+                "version": CODEC_VERSION,
+                "type": model_type,
+                "pk": super().encode(value.pk, context=context),
+            }
+        return super().encode(value, context=context)
+
+    def decode(self, value: Any, *, context: Mapping[str, Any] | None = None) -> Any:
+        value_kind = None
+        has_codec_marker = False
+        if isinstance(value, dict):
+            has_codec_marker = CODEC_KEY in value
+            value_kind = value.get(CODEC_KEY)
+            if not has_codec_marker:
+                value_kind = value.get(TYPE_KEY)
+        if isinstance(value, dict) and value_kind == _MODEL_TYPE:
+            if has_codec_marker:
+                _validate_codec_version(value)
+            model_type = value.get("type")
+            if model_type is None:
+                app_label = value.get("app_label")
+                model_name = value.get("model_name")
+                if isinstance(app_label, str) and isinstance(model_name, str):
+                    model_type = f"{_DJANGO_TYPE_PREFIX}{app_label}/{model_name}"
+            if not isinstance(model_type, str) or not model_type.startswith(
+                _DJANGO_TYPE_PREFIX
+            ):
+                raise DeserializationError("Invalid Django model type")
+            resolver = self.model_resolvers.get(model_type)
+            if resolver is None:
+                raise DeserializationError(
+                    f"Django model type {model_type!r} has no configured resolver"
+                )
+            pk = super().decode(value.get("pk"), context=context)
+            try:
+                resolved = resolver(pk, context or {})
+            except DeserializationError:
+                raise
+            except Exception as exc:
+                raise DeserializationError(
+                    f"Could not resolve Django model reference {model_type}({pk})"
+                ) from exc
+            if resolved is None:
+                raise DeserializationError(
+                    f"Django model reference {model_type}({pk}) was not found"
+                )
+            return resolved
+        return super().decode(value, context=context)
 
 
-def serialize_django_payload(value: Any) -> Any:
+def serialize_django_payload(
+    value: Any,
+    *,
+    type_registry: PayloadTypeRegistry | Iterable[type[Any]] | None = None,
+    model_resolvers: Mapping[str, Callable[[Any, Mapping[str, Any]], Any]]
+    | None = None,
+    context: Mapping[str, Any] | None = None,
+) -> Any:
     """Convert payloads into JSON-safe data while preserving Django models."""
 
-    model_base = _django_model_base()
-    if model_base is not None and isinstance(value, model_base):
-        return {
-            _TYPE_KEY: _MODEL_TYPE,
-            "app_label": value._meta.app_label,
-            "model_name": value._meta.model_name,
-            "pk": serialize_django_payload(value.pk),
-        }
-
-    if isinstance(value, Decimal):
-        return {
-            _TYPE_KEY: _DECIMAL_TYPE,
-            "value": str(value),
-        }
-
-    if is_dataclass(value) and not isinstance(value, type):
-        return {
-            _TYPE_KEY: _DATACLASS_TYPE,
-            "module": value.__class__.__module__,
-            "qualname": value.__class__.__qualname__,
-            "fields": {
-                field.name: serialize_django_payload(getattr(value, field.name))
-                for field in fields(value)
-            },
-        }
-
-    if isinstance(value, dict):
-        return {
-            str(key): serialize_django_payload(inner) for key, inner in value.items()
-        }
-
-    if isinstance(value, list):
-        return [serialize_django_payload(inner) for inner in value]
-
-    if isinstance(value, tuple):
-        return [serialize_django_payload(inner) for inner in value]
-
-    return encode_value(value)
+    return DjangoPayloadCodec(
+        type_registry=type_registry,
+        model_resolvers=model_resolvers,
+    ).encode(value, context=context)
 
 
-def deserialize_django_payload(value: Any) -> Any:
+def deserialize_django_payload(
+    value: Any,
+    *,
+    type_registry: PayloadTypeRegistry | Iterable[type[Any]] | None = None,
+    model_resolvers: Mapping[str, Callable[[Any, Mapping[str, Any]], Any]]
+    | None = None,
+    context: Mapping[str, Any] | None = None,
+) -> Any:
     """Restore payloads created by `serialize_django_payload`."""
 
-    if isinstance(value, list):
-        return [deserialize_django_payload(inner) for inner in value]
-
-    if isinstance(value, dict):
-        if value.get(_TYPE_KEY) == _MODEL_TYPE:
-            model = _django_apps_registry().get_model(
-                value["app_label"],
-                value["model_name"],
-            )
-            pk = deserialize_django_payload(value.get("pk"))
-            try:
-                return model.objects.get(pk=pk)
-            except model.DoesNotExist as exc:
-                raise DeserializationError(
-                    "Referenced "
-                    f"{value['app_label']}.{value['model_name']}({pk}) no longer exists"
-                ) from exc
-
-        if value.get(_TYPE_KEY) == _DECIMAL_TYPE:
-            return Decimal(value["value"])
-
-        if value.get(_TYPE_KEY) == _DATACLASS_TYPE:
-            cls = _resolve_qualname(value["module"], value["qualname"])
-            restored_fields = {
-                key: deserialize_django_payload(inner)
-                for key, inner in value.get("fields", {}).items()
-            }
-            return cls(**restored_fields)
-
-        return {key: deserialize_django_payload(inner) for key, inner in value.items()}
-
-    return decode_value(value)
+    return DjangoPayloadCodec(
+        type_registry=type_registry,
+        model_resolvers=model_resolvers,
+    ).decode(value, context=context)
 
 
 class DjangoPayloadSerializer:
     """JSON serializer for payloads with Django model support."""
 
-    def __init__(self, serializer: JsonSerializer | None = None) -> None:
+    def __init__(
+        self,
+        serializer: JsonSerializer | None = None,
+        *,
+        type_registry: PayloadTypeRegistry | Iterable[type[Any]] | None = None,
+        model_resolvers: Mapping[str, Callable[[Any, Mapping[str, Any]], Any]]
+        | None = None,
+    ) -> None:
         self._serializer = serializer or JsonSerializer()
+        self.codec = DjangoPayloadCodec(
+            type_registry=type_registry,
+            model_resolvers=model_resolvers,
+        )
 
     def dumps(self, value: Any) -> str:
-        return self._serializer.dumps(serialize_django_payload(value))
+        return self._serializer.dumps(self.codec.encode(value))
 
     def dump(self, value: Any) -> bytes:
-        return self._serializer.dump(serialize_django_payload(value))
+        return self._serializer.dump(self.codec.encode(value))
 
     def loads(self, value: str | bytes) -> Any:
-        return deserialize_django_payload(self._serializer.loads(value))
+        return self.codec.decode(self._serializer.loads(value))
 
     def load(self, value: bytes) -> Any:
         return self.loads(value)
 
 
 __all__ = [
+    "DjangoPayloadCodec",
     "DjangoPayloadSerializer",
     "deserialize_django_payload",
     "serialize_django_payload",

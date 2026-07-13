@@ -247,21 +247,32 @@ class Listener:
         if not raw_messages:
             return
 
-        events = [
-            self.dispatcher.decode(
-                MessageEnvelope.from_dict(self.serializer.loads(raw_message))
-            )
+        envelopes = [
+            MessageEnvelope.from_dict(self.serializer.loads(raw_message))
             for raw_message in raw_messages
         ]
+        events = [self.dispatcher.decode(envelope) for envelope in envelopes]
         try:
             handler(events)
         except Exception:
-            self._batch_retry_after[message_type] = datetime.now(
-                timezone.utc
-            ) + timedelta(seconds=spec.max_wait)
-            for event in events:
-                envelope = event.to_envelope()
-                self.transport.publish(buffer_key, self.serializer.dump(envelope))
+            requeued = False
+            for envelope in envelopes:
+                max_retries = (
+                    self.retry_policy.max_retries
+                    if spec.retry_limit is None
+                    else spec.retry_limit
+                )
+                if self._retry_count(envelope) < max_retries:
+                    self._requeue(buffer_key, envelope)
+                    requeued = True
+                else:
+                    self._dead_letter(buffer_key, envelope)
+            if requeued:
+                self._batch_retry_after[message_type] = datetime.now(
+                    timezone.utc
+                ) + timedelta(seconds=spec.max_wait)
+            else:
+                self._batch_retry_after.pop(message_type, None)
             return
 
         self._batch_started_at.pop(message_type, None)
@@ -340,12 +351,14 @@ class Listener:
         response: ResponseMessage,
     ) -> None:
         reply_queue = request_envelope.reply_to or DEFAULT_REPLY_QUEUE
+        codec = self.dispatcher.payload_codec
+        encoded_headers = codec.encode(response.headers)
         response_envelope = MessageEnvelope.create(
             message_type=response.message_type,
             message_kind=response.message_kind,
             version=response.version,
-            payload=response.payload,
-            headers=response.headers,
+            payload=codec.encode(response.payload, context=response.headers),
+            headers=encoded_headers,
             created_at=datetime.now(timezone.utc),
             correlation_id=request_envelope.correlation_id,
             causation_id=request_envelope.message_id,
