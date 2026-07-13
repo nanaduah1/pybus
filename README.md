@@ -19,6 +19,43 @@ extras, starting with:
 - `pybus[redis]`
 - `pybus[django]`
 
+## Typed payloads
+
+Configure a payload codec once on the bus when messages contain Python
+dataclasses or other non-JSON values:
+
+```python
+from dataclasses import dataclass
+from decimal import Decimal
+
+from pybus import PayloadTypeRegistry, PythonPayloadCodec, configure_transport
+
+
+@dataclass
+class ReportDescriptor:
+    report_name: str
+    total: Decimal
+
+
+types = PayloadTypeRegistry([ReportDescriptor])
+bus = configure_transport(
+    transport,
+    payload_codec=PythonPayloadCodec(type_registry=types),
+)
+```
+
+Dataclasses carry a fully qualified identifier such as
+`reports.descriptors:ReportDescriptor` in the encoded value. Consumers resolve
+that identifier through their configured registry; pybus never imports a class
+named by untrusted message data. Register aliases when a class moves modules.
+
+The optional `DjangoPayloadCodec` composes this generic codec and adds only
+Django model references using identifiers such as `django://schools/student`.
+Each allowed model identifier must have an application-supplied resolver. This
+keeps model lookup explicit and lets applications enforce tenant scoping rather
+than allowing pybus to query arbitrary models by primary key. Resolvers receive
+the decoded envelope headers as context alongside the primary key.
+
 ## Status
 
 This repository is the initial scaffold and design home for the framework.

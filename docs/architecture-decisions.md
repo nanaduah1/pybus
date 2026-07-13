@@ -201,3 +201,33 @@ Consequences:
 
 - documentation must point clearly from core v1 to the follow-up track
 - compatibility behavior stays explicit while the implementation layers evolve
+
+---
+
+## ADR-011: Typed payloads use configured codecs and explicit type registries
+
+Decision:
+
+- Configure one payload codec on the bus and use it for every message path.
+- Encode dataclasses with fully qualified Python type identifiers inline in the
+  value.
+- Resolve typed values only through an application-configured registry.
+- Keep Django model resolution in the optional Django codec and require an
+  allowlisted application resolver for every model identifier.
+
+Rationale:
+
+- inline metadata supports nested typed values across Python projects
+- a registry makes refactors explicit through aliases
+- rejecting unknown types avoids arbitrary imports from untrusted payload data
+- generic Python serialization must not depend on Django
+- tenant-aware model lookup belongs in an explicit application resolver, not
+  an unscoped framework default
+
+Consequences:
+
+- every producer and consumer must configure compatible registries
+- moving a payload class requires a registered alias or a versioned migration
+- Django model references use stable `django://app_label/model_name` identifiers
+- legacy marker shapes are read through the same registries and allowlists;
+  arbitrary imports and default-manager lookups are never restored

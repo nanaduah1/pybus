@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import cast
 
+from pybus.codecs import PayloadCodec
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import MessageTimeoutError
@@ -35,6 +36,7 @@ class Pybus:
     listener: Listener
     coordinator: RequestResponseCoordinator
     reply_queue: str
+    payload_codec: PayloadCodec
 
     def __init__(
         self,
@@ -44,9 +46,15 @@ class Pybus:
         serializer: JsonSerializer | None = None,
         topology: QueueTopology | None = None,
         handler_targets: Sequence[object] | None = None,
+        payload_codec: PayloadCodec | None = None,
     ) -> None:
         self.transport = transport
-        self.dispatcher = dispatcher or Dispatcher()
+        if dispatcher is not None and payload_codec is not None:
+            raise ValueError(
+                "payload_codec must be configured on the supplied dispatcher"
+            )
+        self.dispatcher = dispatcher or Dispatcher(payload_codec=payload_codec)
+        self.payload_codec = self.dispatcher.payload_codec
         self.serializer = serializer or JsonSerializer()
         self.topology = topology or QueueTopology()
         self.listener = Listener(
@@ -92,6 +100,7 @@ class Pybus:
             request,
             timeout=timeout,
             reply_to=reply_queue,
+            payload_codec=self.payload_codec,
         )
         self.transport.publish(
             request_queue,
@@ -103,7 +112,13 @@ class Pybus:
             reply_queue,
         )
         response_cls = message_class_for_kind(response_envelope.message_kind)
-        return cast(ResponseMessage, response_cls.from_envelope(response_envelope))
+        return cast(
+            ResponseMessage,
+            response_cls.from_envelope(
+                response_envelope,
+                payload_codec=self.payload_codec,
+            ),
+        )
 
     def listen_once(self, channel: str | tuple[str, ...] | list[str]) -> object | None:
         return self.listener.listen_once(channel)
@@ -122,7 +137,7 @@ class Pybus:
         *,
         queue: str | None = None,
     ) -> MessageEnvelope:
-        envelope = message.to_envelope()
+        envelope = message.to_envelope(payload_codec=self.payload_codec)
         self.transport.publish(
             queue or self.topology.default_queue, self.serializer.dump(envelope)
         )
@@ -183,6 +198,7 @@ def configure_transport(
     serializer: JsonSerializer | None = None,
     topology: QueueTopology | None = None,
     handler_targets: Sequence[object] | None = None,
+    payload_codec: PayloadCodec | None = None,
 ) -> Pybus:
     global _default_bus
     _default_bus = Pybus(
@@ -191,6 +207,7 @@ def configure_transport(
         serializer=serializer,
         topology=topology,
         handler_targets=handler_targets,
+        payload_codec=payload_codec,
     )
     return _default_bus
 

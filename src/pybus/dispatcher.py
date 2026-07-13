@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pybus.codecs import PayloadCodec, resolve_payload_codec
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import HandlerNotFoundError
 from pybus.messages import BaseMessage, message_class_for_kind
@@ -12,16 +13,21 @@ class Dispatcher:
         self,
         registry: Registry | None = None,
         serializer: JsonSerializer | None = None,
+        payload_codec: PayloadCodec | None = None,
     ) -> None:
         self.registry = registry or Registry()
         self.serializer = serializer or JsonSerializer()
+        self.payload_codec = resolve_payload_codec(payload_codec)
 
     def decode(self, message: MessageEnvelope | BaseMessage | dict) -> BaseMessage:
         if isinstance(message, BaseMessage):
             return message
         if isinstance(message, MessageEnvelope):
             message_cls = message_class_for_kind(message.message_kind)
-            return message_cls.from_envelope(message)
+            return message_cls.from_envelope(
+                message,
+                payload_codec=self.payload_codec,
+            )
         if isinstance(message, dict):
             envelope = MessageEnvelope.from_dict(message)
             return self.decode(envelope)

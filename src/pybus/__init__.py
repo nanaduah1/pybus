@@ -1,4 +1,5 @@
 from pybus.contracts import InboxStore, OutboxStore, Transport
+from pybus.codecs import PayloadCodec, PayloadTypeRegistry, PythonPayloadCodec
 from pybus.bus import (
     Pybus,
     configure_transport,
@@ -71,6 +72,9 @@ __all__ = [
     "Listener",
     "MessageEnvelope",
     "OutboxStore",
+    "PayloadCodec",
+    "PayloadTypeRegistry",
+    "PythonPayloadCodec",
     "QueueTopology",
     "Registry",
     "publish_event",

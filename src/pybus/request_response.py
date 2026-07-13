@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from pybus.codecs import PayloadCodec, resolve_payload_codec
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import MessageTimeoutError
 from pybus.messages import RequestMessage, ResponseMessage
@@ -37,6 +38,7 @@ class RequestResponseCoordinator:
         message_id: str | None = None,
         reply_to: str = DEFAULT_REPLY_QUEUE,
         created_at: datetime | None = None,
+        payload_codec: PayloadCodec | None = None,
     ) -> tuple[MessageEnvelope, RequestTicket]:
         created_at = created_at or datetime.now(timezone.utc)
         request_id = message_id or str(uuid4())
@@ -44,12 +46,14 @@ class RequestResponseCoordinator:
         expires_at = (
             created_at + timedelta(seconds=timeout) if timeout is not None else None
         )
+        codec = resolve_payload_codec(payload_codec)
+        encoded_headers = codec.encode(request.headers)
         envelope = MessageEnvelope.create(
             message_type=request.message_type,
             message_kind=request.message_kind,
             version=request.version,
-            payload=request.payload,
-            headers=request.headers,
+            payload=codec.encode(request.payload, context=request.headers),
+            headers=encoded_headers,
             correlation_id=correlation_id,
             causation_id=request.causation_id,
             reply_to=reply_to,
@@ -74,14 +78,17 @@ class RequestResponseCoordinator:
         *,
         message_id: str | None = None,
         created_at: datetime | None = None,
+        payload_codec: PayloadCodec | None = None,
     ) -> MessageEnvelope:
         created_at = created_at or datetime.now(timezone.utc)
+        codec = resolve_payload_codec(payload_codec)
+        encoded_headers = codec.encode(response.headers)
         return MessageEnvelope.create(
             message_type=response.message_type,
             message_kind=response.message_kind,
             version=response.version,
-            payload=response.payload,
-            headers=response.headers,
+            payload=codec.encode(response.payload, context=response.headers),
+            headers=encoded_headers,
             correlation_id=request_envelope.correlation_id,
             causation_id=request_envelope.message_id,
             reply_to=request_envelope.reply_to,

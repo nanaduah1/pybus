@@ -89,6 +89,14 @@ Rules:
 - do not drop in-flight legacy payloads
 - support mixed read behavior during migration
 - ensure serialization is versioned
+- configure the same payload type registry in every producer and consumer
+- register aliases before moving a dataclass to a new Python namespace
+- use `DjangoPayloadCodec` only for Django model references; dataclasses and
+  `Decimal` remain generic pybus concerns
+- configure an allowlisted, tenant-aware resolver for every Django model
+  reference; pybus does not query default managers by primary key
+- legacy dataclass and Django model marker shapes remain readable only when
+  their type identifiers are explicitly registered or allowlisted
 
 ---
 

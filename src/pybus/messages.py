@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar
 
-from pybus._codec import decode_value, encode_value
+from pybus.codecs import PayloadCodec, resolve_payload_codec
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import InvalidMessageDefinitionError
 
@@ -31,14 +31,16 @@ class BaseMessage:
             raise InvalidMessageDefinitionError("headers must be a dictionary")
         return self
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, payload_codec: PayloadCodec | None = None) -> dict[str, Any]:
         self.validate()
+        codec = resolve_payload_codec(payload_codec)
+        encoded_headers = codec.encode(self.headers)
         return {
             "message_type": self.message_type,
             "message_kind": self.message_kind,
             "version": self.version,
-            "payload": encode_value(self.payload),
-            "headers": encode_value(self.headers),
+            "payload": codec.encode(self.payload, context=self.headers),
+            "headers": encoded_headers,
             "correlation_id": self.correlation_id,
             "causation_id": self.causation_id,
             "reply_to": self.reply_to,
@@ -48,8 +50,14 @@ class BaseMessage:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "BaseMessage":
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        payload_codec: PayloadCodec | None = None,
+    ) -> "BaseMessage":
         try:
+            codec = resolve_payload_codec(payload_codec)
             message_kind = data.get("message_kind")
             if message_kind is not None and message_kind != cls.message_kind:
                 raise InvalidMessageDefinitionError(
@@ -63,10 +71,11 @@ class BaseMessage:
             expires_at = data.get("expires_at")
             if isinstance(expires_at, str):
                 expires_at = datetime.fromisoformat(expires_at)
+            headers = codec.decode(data.get("headers") or {})
             return cls(
                 message_type=data["message_type"],
-                payload=decode_value(data.get("payload")),
-                headers=decode_value(data.get("headers") or {}),
+                payload=codec.decode(data.get("payload"), context=headers),
+                headers=headers,
                 correlation_id=data.get("correlation_id"),
                 causation_id=data.get("causation_id"),
                 reply_to=data.get("reply_to"),
@@ -79,13 +88,20 @@ class BaseMessage:
                 f"Missing message field: {exc.args[0]}"
             ) from exc
 
-    def to_envelope(self, *, message_id: str | None = None) -> MessageEnvelope:
+    def to_envelope(
+        self,
+        *,
+        message_id: str | None = None,
+        payload_codec: PayloadCodec | None = None,
+    ) -> MessageEnvelope:
+        codec = resolve_payload_codec(payload_codec)
+        encoded_headers = codec.encode(self.headers)
         return MessageEnvelope.create(
             message_type=self.message_type,
             message_kind=self.message_kind,
             version=self.version,
-            payload=encode_value(self.payload),
-            headers=encode_value(self.headers),
+            payload=codec.encode(self.payload, context=self.headers),
+            headers=encoded_headers,
             correlation_id=self.correlation_id,
             causation_id=self.causation_id,
             reply_to=self.reply_to,
@@ -96,15 +112,22 @@ class BaseMessage:
         )
 
     @classmethod
-    def from_envelope(cls, envelope: MessageEnvelope) -> "BaseMessage":
+    def from_envelope(
+        cls,
+        envelope: MessageEnvelope,
+        *,
+        payload_codec: PayloadCodec | None = None,
+    ) -> "BaseMessage":
         if envelope.message_kind != cls.message_kind:
             raise InvalidMessageDefinitionError(
                 f"Expected message_kind={cls.message_kind!r}, got {envelope.message_kind!r}"
             )
+        codec = resolve_payload_codec(payload_codec)
+        headers = codec.decode(envelope.headers)
         return cls(
             message_type=envelope.message_type,
-            payload=decode_value(envelope.payload),
-            headers=decode_value(envelope.headers),
+            payload=codec.decode(envelope.payload, context=headers),
+            headers=headers,
             correlation_id=envelope.correlation_id,
             causation_id=envelope.causation_id,
             reply_to=envelope.reply_to,
