@@ -61,6 +61,22 @@ keeps model lookup explicit and lets applications enforce tenant scoping rather
 than allowing pybus to query arbitrary models by primary key. Resolvers receive
 the decoded envelope headers as context alongside the primary key.
 
+## Workers
+
+Run registered handlers through the reusable worker owned by the configured
+bus:
+
+```python
+worker = bus.create_worker(error_delay=1.0)
+worker.run()
+```
+
+`worker.stop()` cooperatively prevents another poll after any in-flight poll
+finishes. Lifecycle hooks can wrap polling; Django applications can use
+`DjangoConnectionCleanupHook` to close obsolete database connections around
+each cycle. The worker deliberately does not install signal handlers or own the
+shared transport lifecycle.
+
 ## Status
 
 This repository is the initial scaffold and design home for the framework.

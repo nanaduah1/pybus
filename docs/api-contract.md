@@ -26,6 +26,7 @@ from pybus.envelope import MessageEnvelope
 from pybus.registry import Registry
 from pybus.dispatcher import Dispatcher
 from pybus.listener import Listener
+from pybus.worker import Worker, WorkerHook
 from pybus.serializer import JsonSerializer
 from pybus.contracts import Transport, OutboxStore, InboxStore
 ```
@@ -34,7 +35,7 @@ Optional integrations:
 
 ```python
 from pybus.integrations.redis import RedisTransport
-from pybus.integrations.django import DjangoBusAdapter
+from pybus.integrations.django import DjangoBusAdapter, DjangoConnectionCleanupHook
 ```
 
 These optional integrations must not be imported by the core package during
@@ -380,7 +381,8 @@ This is an intentional native-pybus boundary. A migration compatibility adapter
 may explicitly consume legacy failed-queue retries, but it must not configure the
 native listener's terminal dead-letter channel as an ordinary worker input.
 
-If a claimed batch member cannot be decoded, the listener writes a terminal
+If a claimed ordinary message or batch member cannot be decoded, the listener
+writes a terminal
 `pybus.message.decode_failed` envelope with this payload and header contract:
 
 ```json
@@ -390,19 +392,62 @@ If a claimed batch member cannot be decoded, the listener writes a terminal
     "raw_message_encoding": "base64",
     "error_type": "DeserializationError"
   },
-  "headers": {"dead_lettered_from": "batched:<message_type>"}
+  "headers": {"dead_lettered_from": "<source queue>"}
 }
 ```
 
 The envelope's `content_encoding` remains unset because only the nested raw
-message field is base64 encoded. Valid siblings from the same claimed batch must
-continue to their handler.
+message field is base64 encoded. The next ordinary message, and valid siblings
+from the same claimed batch, must remain processable.
 
-The listener should preserve the current worker model defaults:
+### 9.1 Worker lifecycle
+
+`Worker` provides the reusable blocking loop around `Listener.listen_once`.
+`Pybus.create_worker()` creates one for the bus default queue unless the caller
+supplies a queue or ordered queue sequence.
+
+Lifecycle callbacks run in this order:
+
+1. `on_start` once, in hook order
+2. `before_poll`, then one listener poll, then `after_poll`, in hook order
+3. `on_error` in hook order when a cycle raises an `Exception`
+4. `on_stop` once for successfully started hooks, in reverse order
+
+`stop()` is thread-safe and idempotent. It prevents a new poll, while an
+already-running poll is allowed to finish. The worker catches `Exception`, not
+`BaseException`, and waits the configured fixed `error_delay` through its stop
+event so shutdown can interrupt the delay. A dead-letter queue cannot be used
+as worker input.
+
+Hook failures are isolated where recovery is safe: every error observer and
+stop hook is attempted. An `after_poll` failure is reported without repeating
+the delivery that already completed. A failed `before_poll` skips consumption
+for that cycle.
+
+Known pre-claim polling and lifecycle errors are recoverable cycle failures. A
+Redis destructive-pop exception has an unknown server-side claim outcome and is
+therefore indeterminate. If a retry, dead-letter, poison record, continuation,
+batch buffer, or response cannot be encoded or published after a message was
+claimed, the listener also raises `IndeterminateDeliveryError`. The worker
+reports that error to hooks and then aborts instead of consuming later messages.
+
+The optional `DjangoConnectionCleanupHook` lazily imports Django and runs
+`close_old_connections()` before and after each poll and again at shutdown.
+The core package remains importable without Django installed.
+
+The worker does not own or disconnect its transport. Current list transports
+consume with a destructive pop, so a process crash or indeterminate transport
+failure after claim can still lose claimed work. Failing closed prevents the
+worker from draining later queues but cannot restore the claimed item. A batch
+claim may leave multiple already-popped members indeterminate. A future
+claim/ack transport is required for a crash-safe at-least-once guarantee; this
+lifecycle API does not imply one.
+
+The topology should preserve these declared defaults:
 
 - default queue
-- dead-letter queue
 - slow queue
+- terminal dead-letter storage, which is never normal worker input
 - any additional queues explicitly configured by the app
 
 unless explicitly configured otherwise.

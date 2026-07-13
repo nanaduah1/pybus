@@ -29,5 +29,9 @@ class TransportError(PybusError):
     """Raised when a transport operation fails."""
 
 
+class IndeterminateDeliveryError(TransportError):
+    """Raised when a destructive claim or its later settlement is indeterminate."""
+
+
 class InvalidMessageDefinitionError(ValueError, PybusError):
     """Raised when a message or envelope definition is invalid."""

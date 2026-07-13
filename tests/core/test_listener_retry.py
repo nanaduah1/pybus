@@ -7,6 +7,7 @@ import pytest
 
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
+from pybus.exceptions import IndeterminateDeliveryError
 from pybus.handlers import ContinueProcessing, batched_event_handler, event_handler
 from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME, Listener
 from pybus.messages import EventMessage
@@ -14,6 +15,7 @@ from pybus.registry import Registry
 from pybus.retries import RetryPolicy
 from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
+from pybus.worker import Worker
 
 
 class RecordingTransport(MemoryTransport):
@@ -24,6 +26,20 @@ class RecordingTransport(MemoryTransport):
     def consume(self, channel: str, timeout: int = 5) -> bytes | None:
         self.consume_calls.append((channel, timeout))
         return super().consume(channel, timeout=timeout)
+
+
+class SettlementFailureTransport(MemoryTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_channels: set[str] = set()
+
+    def publish(self, channel: str, message: bytes) -> None:
+        if channel in self.fail_channels:
+            raise ConnectionError(f"failed to publish to {channel}")
+        super().publish(channel, message)
+
+    def seed(self, channel: str, message: bytes) -> None:
+        super().publish(channel, message)
 
 
 class MutableClock:
@@ -158,6 +174,140 @@ def test_listener_requeues_continuation_on_same_queue() -> None:
 
     assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
     assert handled == ["B-1"]
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_worker_aborts_after_retry_publication_fails_post_claim() -> None:
+    transport = SettlementFailureTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1),
+    )
+    registry.register(
+        "event",
+        "billing.fail",
+        lambda message: (_ for _ in ()).throw(RuntimeError("handler failed")),
+    )
+    for message_id in ("first", "second"):
+        transport.seed(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="billing.fail",
+                    payload={"id": message_id},
+                ).to_envelope(message_id=message_id)
+            ),
+        )
+    transport.fail_channels.add(DEFAULT_QUEUE_NAME)
+
+    with pytest.raises(IndeterminateDeliveryError, match="retry requeue"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_worker_aborts_after_dead_letter_publication_fails_post_claim() -> None:
+    transport = SettlementFailureTransport()
+    serializer = JsonSerializer()
+    listener = Listener(transport=transport, serializer=serializer)
+    for message_id in ("first", "second"):
+        transport.seed(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="unhandled.event",
+                    payload={"id": message_id},
+                ).to_envelope(message_id=message_id)
+            ),
+        )
+    transport.fail_channels.add(DEFAULT_FAILED_QUEUE_NAME)
+
+    with pytest.raises(IndeterminateDeliveryError, match="dead-letter publication"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_worker_aborts_after_poison_publication_fails_post_claim() -> None:
+    transport = SettlementFailureTransport()
+    listener = Listener(transport=transport, serializer=JsonSerializer())
+    transport.seed(DEFAULT_QUEUE_NAME, b"not-json")
+    transport.seed(DEFAULT_QUEUE_NAME, b"must-not-be-consumed")
+    transport.fail_channels.add(DEFAULT_FAILED_QUEUE_NAME)
+
+    with pytest.raises(IndeterminateDeliveryError, match="decode-failure publication"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_worker_aborts_after_continuation_publication_fails_post_claim() -> None:
+    transport = SettlementFailureTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+
+    @event_handler("billing.chunked")
+    def continue_event(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing()
+
+    registry.register("event", "billing.chunked", continue_event)
+    for message_id in ("first", "second"):
+        transport.seed(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="billing.chunked",
+                    payload={"id": message_id},
+                ).to_envelope(message_id=message_id)
+            ),
+        )
+    transport.fail_channels.add(DEFAULT_QUEUE_NAME)
+
+    with pytest.raises(IndeterminateDeliveryError, match="continuation"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_worker_aborts_after_batch_buffer_publication_fails_post_claim() -> None:
+    transport = SettlementFailureTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=30)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        raise AssertionError("buffering should fail first")
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    for message_id in ("first", "second"):
+        transport.seed(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="audit.log",
+                    payload={"id": message_id},
+                ).to_envelope(message_id=message_id)
+            ),
+        )
+    transport.fail_channels.add("batched:audit.log")
+
+    with pytest.raises(IndeterminateDeliveryError, match="batch buffering"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
     assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
@@ -643,3 +793,41 @@ def test_naive_header_last_attempt_falls_back_without_consuming_retry() -> None:
     ).to_envelope()
 
     assert listener._should_delay(envelope, listener._spec_for(handle_event)) is True
+
+
+def test_malformed_ordinary_message_is_terminal_and_next_message_survives() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    handled: list[str] = []
+
+    @event_handler("audit.log")
+    def handle_event(message: EventMessage) -> None:
+        handled.append(message.payload["entry"])
+
+    registry.register("event", "audit.log", handle_event)
+    transport.publish(DEFAULT_QUEUE_NAME, b"not-json")
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log",
+                payload={"entry": "valid"},
+            ).to_envelope()
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert handled == ["valid"]
+    poison = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_FAILED_QUEUE_NAME))
+    )
+    assert poison.message_type == "pybus.message.decode_failed"
+    assert poison.headers == {"dead_lettered_from": DEFAULT_QUEUE_NAME}

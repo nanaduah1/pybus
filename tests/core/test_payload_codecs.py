@@ -349,6 +349,28 @@ def test_configured_codec_round_trips_event_payload_and_headers() -> None:
     assert published.message_id
 
 
+def test_configured_codec_round_trips_through_worker_factory() -> None:
+    transport = MemoryTransport()
+    codec = configured_codec()
+    bus = Pybus(transport=transport, payload_codec=codec)
+    handled: list[EventMessage] = []
+    bus.dispatcher.registry.register("event", "report.queued", handled.append)
+    bus.publish_event(
+        EventMessage(
+            message_type="report.queued",
+            payload=ReportDescriptor("Bills", Decimal("12.50")),
+            headers={"amount": Decimal("12.50")},
+            correlation_id="corr-worker",
+        )
+    )
+
+    bus.create_worker(error_delay=0).run(max_iterations=1)
+
+    assert handled[0].payload == ReportDescriptor("Bills", Decimal("12.50"))
+    assert handled[0].headers == {"amount": Decimal("12.50")}
+    assert handled[0].correlation_id == "corr-worker"
+
+
 def test_batch_requeue_preserves_message_identity_and_encoded_payload() -> None:
     transport = MemoryTransport()
     codec = configured_codec()

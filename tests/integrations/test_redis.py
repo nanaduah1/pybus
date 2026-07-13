@@ -5,10 +5,11 @@ import pickle
 
 import pytest
 
+from pybus.bus import Pybus
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.handlers import batched_event_handler
-from pybus.exceptions import DeserializationError
+from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
 from pybus.integrations.redis import (
     RedisTransport,
     decode_json_redis_payload,
@@ -19,16 +20,24 @@ from pybus.serializer import JsonSerializer
 from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME, Listener
 from pybus.messages import EventMessage
 from pybus.registry import Registry
+from pybus.worker import Worker
 
 
 class FakeRedisClient:
     def __init__(self) -> None:
         self.queues: dict[str, list[bytes]] = {}
+        self.brpop_error: Exception | None = None
+        self.eval_error: Exception | None = None
+        self.brpop_calls = 0
+        self.eval_calls = 0
 
     def lpush(self, channel: str, message: bytes) -> None:
         self.queues.setdefault(channel, []).insert(0, message)
 
     def brpop(self, channel: str, timeout: int = 5):
+        self.brpop_calls += 1
+        if self.brpop_error is not None:
+            raise self.brpop_error
         queue = self.queues.get(channel, [])
         if not queue:
             return None
@@ -38,6 +47,9 @@ class FakeRedisClient:
         return len(self.queues.get(channel, []))
 
     def eval(self, script: str, key_count: int, channel: str, limit: int):
+        self.eval_calls += 1
+        if self.eval_error is not None:
+            raise self.eval_error
         del script, key_count
         queue = self.queues.get(channel, [])
         claimed = queue[:limit]
@@ -53,6 +65,87 @@ def test_redis_transport_publish_and_consume() -> None:
 
     assert transport.consume("pybus.jobs") == b"payload"
     assert transport.consume("pybus.jobs") is None
+
+
+def test_redis_default_and_slow_workers_dispatch_distinct_queues() -> None:
+    client = FakeRedisClient()
+    bus = Pybus(transport=RedisTransport(client=client))
+    handled: list[tuple[str, object]] = []
+    bus.dispatcher.registry.register(
+        "event",
+        "smoke.default",
+        lambda message: handled.append(("default", message.payload)),
+    )
+    bus.dispatcher.registry.register(
+        "event",
+        "smoke.slow",
+        lambda message: handled.append(("slow", message.payload)),
+    )
+    bus.publish_event(EventMessage(message_type="smoke.default", payload={"id": 1}))
+    bus.publish_event(
+        EventMessage(message_type="smoke.slow", payload={"id": 2}),
+        queue=bus.topology.slow_queue,
+    )
+    dead_letter_sentinel = bus.serializer.dump(
+        EventMessage(message_type="smoke.failed", payload={"id": 3}).to_envelope()
+    )
+    bus.transport.publish(bus.topology.dead_letter_queue, dead_letter_sentinel)
+
+    bus.create_worker(error_delay=0).run(max_iterations=1)
+    bus.create_worker(bus.topology.slow_queue, error_delay=0).run(max_iterations=1)
+
+    assert handled == [("default", {"id": 1}), ("slow", {"id": 2})]
+    assert bus.transport.size(bus.topology.dead_letter_queue) == 1
+    assert bus.transport.consume(bus.topology.dead_letter_queue) == dead_letter_sentinel
+
+
+def test_redis_worker_aborts_on_indeterminate_destructive_pop() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    listener = Listener(transport=transport, serializer=JsonSerializer())
+    transport.publish(DEFAULT_QUEUE_NAME, b"later-work")
+    client.brpop_error = ConnectionError("reply lost")
+
+    with pytest.raises(IndeterminateDeliveryError, match="destructive-pop"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert client.brpop_calls == 1
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_redis_worker_aborts_on_indeterminate_batch_claim() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+
+    @batched_event_handler("audit.log", batch_size=1, max_wait=0)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        raise AssertionError("batch outcome is unknown")
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    transport.publish(
+        "batched:audit.log",
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log", payload={"entry": "claimed"}
+            ).to_envelope()
+        ),
+    )
+    transport.publish(DEFAULT_QUEUE_NAME, b"later-work")
+    client.eval_error = ConnectionError("batch reply lost")
+
+    with pytest.raises(IndeterminateDeliveryError, match="batch consume"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert client.eval_calls == 1
+    assert client.brpop_calls == 0
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
 def test_redis_batch_retry_is_bounded_and_failed_queue_is_terminal() -> None:
@@ -135,6 +228,44 @@ def test_redis_malformed_batch_item_does_not_drop_valid_sibling() -> None:
     transport.publish(DEFAULT_FAILED_QUEUE_NAME, raw_poison)
     assert listener.listen_once(DEFAULT_FAILED_QUEUE_NAME) is None
     assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+
+
+def test_redis_worker_dead_letters_malformed_message_and_continues() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    handled: list[str] = []
+    registry.register(
+        "event",
+        "audit.log",
+        lambda message: handled.append(message.payload["entry"]),
+    )
+    malformed = b"not-json"
+    transport.publish(DEFAULT_QUEUE_NAME, malformed)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log",
+                payload={"entry": "valid"},
+            ).to_envelope()
+        ),
+    )
+
+    Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run(max_iterations=2)
+
+    assert handled == ["valid"]
+    raw_poison = transport.consume(DEFAULT_FAILED_QUEUE_NAME)
+    poison = MessageEnvelope.from_dict(serializer.loads(raw_poison))
+    assert poison.message_type == "pybus.message.decode_failed"
+    assert poison.headers == {"dead_lettered_from": DEFAULT_QUEUE_NAME}
+    assert base64.b64decode(poison.payload["raw_message"]) == malformed
 
 
 def test_decode_json_redis_payload_only_accepts_json() -> None:

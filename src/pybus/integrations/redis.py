@@ -4,7 +4,7 @@ import pickle
 from importlib import import_module
 from typing import Any
 
-from pybus.exceptions import DeserializationError
+from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
 from pybus.serializer import JsonSerializer
 
 
@@ -45,7 +45,12 @@ class RedisTransport:
         self._client.lpush(channel, message)
 
     def consume(self, channel: str, timeout: int = 5) -> bytes | None:
-        result = self._client.brpop(channel, timeout=timeout)
+        try:
+            result = self._client.brpop(channel, timeout=timeout)
+        except Exception as exc:
+            raise IndeterminateDeliveryError(
+                "Redis consume failed with an unknown destructive-pop outcome"
+            ) from exc
         if result is None:
             return None
         _, message = result
@@ -60,7 +65,12 @@ class RedisTransport:
         redis.call('LTRIM', KEYS[1], ARGV[1], -1)
         return res
         """
-        return list(self._client.eval(lua_pop, 1, channel, limit))
+        try:
+            return list(self._client.eval(lua_pop, 1, channel, limit))
+        except Exception as exc:
+            raise IndeterminateDeliveryError(
+                "Redis batch consume failed with an unknown destructive-pop outcome"
+            ) from exc
 
     def ack(self, receipt: str) -> None:
         """Ack is a no-op for the list-based transport."""

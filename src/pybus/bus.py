@@ -25,6 +25,7 @@ from pybus.request_response import (
     default_reply_queue_name,
 )
 from pybus.serializer import JsonSerializer
+from pybus.worker import Worker, WorkerHook
 
 
 @dataclass(slots=True)
@@ -130,6 +131,24 @@ class Pybus:
         max_messages: int | None = None,
     ) -> list[object]:
         return self.listener.listen(channel, max_messages=max_messages)
+
+    def create_worker(
+        self,
+        channel: str | Sequence[str] | None = None,
+        *,
+        hooks: Sequence[WorkerHook] = (),
+        error_delay: float = 1.0,
+        logger=None,
+        stop_event=None,
+    ) -> Worker:
+        return Worker(
+            self.listener,
+            self.topology.default_queue if channel is None else channel,
+            hooks=hooks,
+            error_delay=error_delay,
+            logger=logger,
+            stop_event=stop_event,
+        )
 
     def _publish(
         self,
