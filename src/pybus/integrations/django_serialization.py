@@ -5,9 +5,12 @@ from importlib import import_module
 from typing import Any, Callable
 
 from pybus.codecs import (
+    CODEC_KEY,
+    CODEC_VERSION,
     TYPE_KEY,
     PayloadTypeRegistry,
     PythonPayloadCodec,
+    _validate_codec_version,
 )
 from pybus.exceptions import DeserializationError, SerializationError
 from pybus.serializer import JsonSerializer
@@ -49,14 +52,24 @@ class DjangoPayloadCodec(PythonPayloadCodec):
                     f"Django model type {model_type!r} has no configured resolver"
                 )
             return {
-                TYPE_KEY: _MODEL_TYPE,
+                CODEC_KEY: _MODEL_TYPE,
+                "version": CODEC_VERSION,
                 "type": model_type,
                 "pk": super().encode(value.pk, context=context),
             }
         return super().encode(value, context=context)
 
     def decode(self, value: Any, *, context: Mapping[str, Any] | None = None) -> Any:
-        if isinstance(value, dict) and value.get(TYPE_KEY) == _MODEL_TYPE:
+        value_kind = None
+        has_codec_marker = False
+        if isinstance(value, dict):
+            has_codec_marker = CODEC_KEY in value
+            value_kind = value.get(CODEC_KEY)
+            if not has_codec_marker:
+                value_kind = value.get(TYPE_KEY)
+        if isinstance(value, dict) and value_kind == _MODEL_TYPE:
+            if has_codec_marker:
+                _validate_codec_version(value)
             model_type = value.get("type")
             if model_type is None:
                 app_label = value.get("app_label")

@@ -97,6 +97,9 @@ Rules:
   reference; pybus does not query default managers by primary key
 - legacy dataclass and Django model marker shapes remain readable only when
   their type identifiers are explicitly registered or allowlisted
+- new dataclass, `Decimal`, and Django-model encodings use the versioned
+  `__pybus_codec__` namespace; unknown `__pybus_type__` values remain unchanged
+  as application-owned JSON
 
 ---
 

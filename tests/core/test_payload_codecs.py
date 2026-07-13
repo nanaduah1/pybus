@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 
 from pybus import CommandMessage, EventMessage, Pybus, RequestMessage, ResponseMessage
-from pybus.codecs import PayloadTypeRegistry, PythonPayloadCodec
+from pybus.codecs import CODEC_KEY, PayloadTypeRegistry, PythonPayloadCodec
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import DeserializationError, SerializationError
 from pybus.handlers import batched_event_handler
@@ -50,12 +50,16 @@ def test_python_payload_codec_stores_fully_qualified_dataclass_type() -> None:
     encoded = codec.encode(payload)
 
     assert encoded == {
-        "__pybus_type__": "dataclass",
+        "__pybus_codec__": "dataclass",
         "type": f"{ReportDescriptor.__module__}:{ReportDescriptor.__qualname__}",
         "version": 1,
         "fields": {
             "report_name": "Bills",
-            "total": {"__pybus_type__": "decimal", "value": "12.50"},
+            "total": {
+                "__pybus_codec__": "decimal",
+                "version": 1,
+                "value": "12.50",
+            },
         },
     }
     assert codec.decode(encoded) == payload
@@ -117,11 +121,11 @@ def test_python_payload_codec_preserves_decimal_boundaries_exactly() -> None:
         assert codec.decode(codec.encode(value)) == value
 
 
-def test_python_payload_codec_rejects_unknown_reserved_type() -> None:
+def test_python_payload_codec_preserves_unknown_legacy_type_marker() -> None:
     codec = PythonPayloadCodec()
+    payload = {"__pybus_type__": "future_money", "value": "1.00"}
 
-    with pytest.raises(DeserializationError, match="Unsupported payload type"):
-        codec.decode({"__pybus_type__": "future_money", "value": "1.00"})
+    assert codec.decode(payload) == payload
 
 
 @pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity")])
@@ -165,9 +169,76 @@ def test_registry_rejects_conflicting_canonical_ids() -> None:
         registry.register(ReportDescriptor, type_id="reports:other")
 
 
+def test_registry_alias_conflict_does_not_partially_register_type() -> None:
+    registry = PayloadTypeRegistry()
+    registry.register(ReportDescriptor, type_id="reports:descriptor")
+
+    with pytest.raises(ValueError, match="already registered"):
+        registry.register(
+            ReportRequest,
+            type_id="reports:request",
+            aliases=("reports:descriptor",),
+        )
+
+    with pytest.raises(DeserializationError, match="not registered"):
+        registry.resolve("reports:request")
+    with pytest.raises(SerializationError, match="not registered"):
+        registry.type_id_for(ReportRequest)
+
+
 def test_codec_requires_registration_before_encoding_dataclass() -> None:
     with pytest.raises(SerializationError, match="not registered"):
         PythonPayloadCodec().encode(ReportDescriptor("Bills", Decimal("1.00")))
+
+
+def test_codec_preserves_application_owned_legacy_type_marker() -> None:
+    transport = MemoryTransport()
+    bus = Pybus(transport=transport)
+    handled: list[EventMessage] = []
+    bus.dispatcher.registry.register("event", "rules.recorded", handled.append)
+    payload = {
+        "__pybus_type__": "business_rule",
+        "value": "keep-me",
+        "nested": {
+            "__pybus_codec__": "business_rule",
+            "version": 1,
+            "value": "also-keep-me",
+        },
+    }
+
+    bus.publish_event(EventMessage(message_type="rules.recorded", payload=payload))
+    bus.listen_once(bus.topology.default_queue)
+
+    assert handled[0].payload == payload
+
+
+def test_codec_wraps_application_mapping_with_codec_marker() -> None:
+    codec = PythonPayloadCodec()
+    payload = {CODEC_KEY: "business_rule", "version": 1, "value": "keep-me"}
+
+    encoded = codec.encode(payload)
+
+    assert encoded == {
+        CODEC_KEY: "mapping",
+        "version": 1,
+        "value": payload,
+    }
+    assert codec.decode(encoded) == payload
+
+
+def test_codec_rejects_unknown_codec_owned_type_marker() -> None:
+    codec = PythonPayloadCodec()
+
+    with pytest.raises(DeserializationError, match="Unsupported payload codec type"):
+        codec.decode({CODEC_KEY: "future_money", "version": 1, "value": "1.00"})
+
+
+@pytest.mark.parametrize("version", [True, 1.0])
+def test_codec_rejects_non_integer_codec_version(version: object) -> None:
+    codec = PythonPayloadCodec()
+
+    with pytest.raises(DeserializationError, match="Unsupported payload codec version"):
+        codec.decode({CODEC_KEY: "decimal", "version": version, "value": "1.00"})
 
 
 def test_codec_decodes_registry_backed_legacy_dataclass_shape() -> None:

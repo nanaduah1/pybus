@@ -55,7 +55,8 @@ def test_serialize_django_payload_works_without_django_installed(monkeypatch) ->
 
     assert serialize_django_payload(payload) == {
         "amount": {
-            "__pybus_type__": "decimal",
+            "__pybus_codec__": "decimal",
+            "version": 1,
             "value": "3.75",
         }
     }
@@ -110,7 +111,8 @@ def test_django_payload_serializer_round_trips_fake_django_model(monkeypatch) ->
     )
 
     assert serialized == {
-        "__pybus_type__": "django_model",
+        "__pybus_codec__": "django_model",
+        "version": 1,
         "type": "django://schools/student",
         "pk": 7,
     }
@@ -143,6 +145,23 @@ def test_django_codec_rejects_unregistered_model_reference() -> None:
         codec.decode(
             {
                 "__pybus_type__": "django_model",
+                "type": "django://schools/student",
+                "pk": 7,
+            }
+        )
+
+
+@pytest.mark.parametrize("version", [True, 1.0])
+def test_django_codec_rejects_non_integer_codec_version(version: object) -> None:
+    codec = DjangoPayloadCodec(
+        model_resolvers={"django://schools/student": lambda pk, context: {"pk": pk}}
+    )
+
+    with pytest.raises(DeserializationError, match="Unsupported payload codec version"):
+        codec.decode(
+            {
+                "__pybus_codec__": "django_model",
+                "version": version,
                 "type": "django://schools/student",
                 "pk": 7,
             }
@@ -241,7 +260,7 @@ def test_django_payload_codec_delegates_python_values_to_core_codec() -> None:
 
     encoded = codec.encode(payload)
 
-    assert encoded["__pybus_type__"] == "dataclass"
+    assert encoded["__pybus_codec__"] == "dataclass"
     assert (
         encoded["type"] == f"{ExamplePayload.__module__}:{ExamplePayload.__qualname__}"
     )

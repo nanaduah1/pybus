@@ -209,8 +209,8 @@ Consequences:
 Decision:
 
 - Configure one payload codec on the bus and use it for every message path.
-- Encode dataclasses with fully qualified Python type identifiers inline in the
-  value.
+- Encode dataclasses with fully qualified Python type identifiers inside a
+  versioned, codec-owned marker namespace.
 - Resolve typed values only through an application-configured registry.
 - Keep Django model resolution in the optional Django codec and require an
   allowlisted application resolver for every model identifier.
@@ -231,3 +231,7 @@ Consequences:
 - Django model references use stable `django://app_label/model_name` identifiers
 - legacy marker shapes are read through the same registries and allowlists;
   arbitrary imports and default-manager lookups are never restored
+- unknown legacy marker values remain application-owned JSON, while unknown
+  codec-owned types and versions fail closed
+- application mappings containing the codec marker are escaped through a
+  versioned mapping wrapper before transport

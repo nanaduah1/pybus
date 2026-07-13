@@ -126,7 +126,7 @@ version, and recursively encoded fields:
 
 ```json
 {
-  "__pybus_type__": "dataclass",
+  "__pybus_codec__": "dataclass",
   "type": "reports.descriptors:ReportDescriptor",
   "version": 1,
   "fields": {}
@@ -136,6 +136,14 @@ version, and recursively encoded fields:
 Inline metadata is required because nested values may have different types.
 Envelope headers may additionally describe the top-level schema, but are not a
 replacement for nested metadata.
+
+`__pybus_codec__` is the versioned namespace for codec-owned values. Unknown
+codec types and versions fail deserialization. Known legacy `__pybus_type__`
+encodings remain readable during migration; unknown legacy marker values are
+ordinary application JSON and round-trip unchanged.
+Application mappings containing `__pybus_codec__` are encoded through a
+versioned mapping wrapper, including when nested, so the reserved codec key
+cannot collide with ordinary payload data.
 
 Producers and consumers must register allowed dataclass types through
 `PayloadTypeRegistry`.

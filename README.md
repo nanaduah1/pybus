@@ -48,6 +48,11 @@ Dataclasses carry a fully qualified identifier such as
 `reports.descriptors:ReportDescriptor` in the encoded value. Consumers resolve
 that identifier through their configured registry; pybus never imports a class
 named by untrusted message data. Register aliases when a class moves modules.
+New dataclass, `Decimal`, and Django-model encodings use the versioned
+`__pybus_codec__` marker namespace. Known legacy `__pybus_type__` values remain
+readable, while unknown legacy markers are preserved as application-owned JSON.
+Application mappings that contain `__pybus_codec__` are escaped through a
+versioned mapping wrapper so their keys and values still round-trip unchanged.
 
 The optional `DjangoPayloadCodec` composes this generic codec and adds only
 Django model references using identifiers such as `django://schools/student`.
