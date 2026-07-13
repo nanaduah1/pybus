@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import base64
 import pickle
+from types import SimpleNamespace
 
 import pytest
 
+import pybus.integrations.redis as redis_integration
 from pybus.bus import Pybus
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.handlers import batched_event_handler
 from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
 from pybus.integrations.redis import (
+    RedisScheduleStateStore,
     RedisTransport,
     decode_json_redis_payload,
     decode_legacy_redis_payload,
@@ -20,14 +23,18 @@ from pybus.serializer import JsonSerializer
 from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME, Listener
 from pybus.messages import EventMessage
 from pybus.registry import Registry
+from pybus.scheduling import configure_scheduler
 from pybus.worker import Worker
 
 
 class FakeRedisClient:
     def __init__(self) -> None:
         self.queues: dict[str, list[bytes]] = {}
+        self.values: dict[str, bytes] = {}
         self.brpop_error: Exception | None = None
         self.eval_error: Exception | None = None
+        self.get_error: Exception | None = None
+        self.set_error: Exception | None = None
         self.brpop_calls = 0
         self.eval_calls = 0
 
@@ -55,6 +62,115 @@ class FakeRedisClient:
         claimed = queue[:limit]
         self.queues[channel] = queue[limit:]
         return claimed
+
+    def get(self, key: str) -> bytes | None:
+        if self.get_error is not None:
+            raise self.get_error
+        return self.values.get(key)
+
+    def set(self, key: str, value: str) -> None:
+        if self.set_error is not None:
+            raise self.set_error
+        self.values[key] = value.encode("utf-8")
+
+
+def test_redis_schedule_state_store_round_trips_text() -> None:
+    client = FakeRedisClient()
+    store = RedisScheduleStateStore(client=client)
+
+    assert store.get("missing") is None
+
+    store.set("pybus.scheduler.state:reports", '{"version":1}')
+
+    assert store.get("pybus.scheduler.state:reports") == '{"version":1}'
+
+
+def test_configure_scheduler_accepts_redis_state_store() -> None:
+    store = RedisScheduleStateStore(client=FakeRedisClient())
+
+    scheduler = configure_scheduler(state_store=store)
+
+    assert scheduler.state_store is store
+
+
+def test_redis_schedule_state_store_accepts_string_responses() -> None:
+    class StringClient:
+        def __init__(self) -> None:
+            self.value: str | None = None
+
+        def get(self, key: str) -> str | None:
+            return self.value
+
+        def set(self, key: str, value: str) -> None:
+            self.value = value
+
+    client = StringClient()
+    store = RedisScheduleStateStore(client=client)
+    store.set("state", "value")
+
+    assert store.get("state") == "value"
+
+
+def test_redis_schedule_state_store_rejects_unexpected_response_type() -> None:
+    class InvalidClient:
+        def get(self, key: str) -> int:
+            return 42
+
+        def set(self, key: str, value: str) -> None:
+            return None
+
+    store = RedisScheduleStateStore(client=InvalidClient())
+
+    with pytest.raises(TypeError, match="bytes, str, or None"):
+        store.get("state")
+
+
+def test_redis_schedule_state_store_propagates_client_errors() -> None:
+    client = FakeRedisClient()
+    store = RedisScheduleStateStore(client=client)
+    client.get_error = ConnectionError("read failed")
+
+    with pytest.raises(ConnectionError, match="read failed"):
+        store.get("state")
+
+    client.get_error = None
+    client.set_error = ConnectionError("write failed")
+    with pytest.raises(ConnectionError, match="write failed"):
+        store.set("state", "value")
+
+
+def test_redis_schedule_state_store_builds_client_lazily_from_url(monkeypatch) -> None:
+    client = FakeRedisClient()
+
+    class StrictRedis:
+        @staticmethod
+        def from_url(url: str):
+            assert url == "redis://scheduler"
+            return client
+
+    redis_module = SimpleNamespace(StrictRedis=StrictRedis)
+    monkeypatch.setattr(
+        redis_integration,
+        "import_module",
+        lambda name: redis_module,
+    )
+
+    store = RedisScheduleStateStore(url="redis://scheduler")
+    store.set("state", "value")
+
+    assert store.get("state") == "value"
+
+
+def test_redis_schedule_state_store_url_requires_optional_dependency(
+    monkeypatch,
+) -> None:
+    def missing_redis(name: str):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(redis_integration, "import_module", missing_redis)
+
+    with pytest.raises(RuntimeError, match="RedisScheduleStateStore from a url"):
+        RedisScheduleStateStore(url="redis://scheduler")
 
 
 def test_redis_transport_publish_and_consume() -> None:

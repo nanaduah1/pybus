@@ -8,6 +8,48 @@ from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
 from pybus.serializer import JsonSerializer
 
 
+def _client_from_url(url: str | None, *, component: str) -> Any:
+    if url is None:
+        raise ValueError("A Redis url is required when client is not provided")
+
+    try:
+        redis = import_module("redis")
+    except ModuleNotFoundError as exc:  # pragma: no cover - import safety
+        raise RuntimeError(
+            f"redis is required to build a {component} from a url"
+        ) from exc
+    return redis.StrictRedis.from_url(url)
+
+
+class RedisScheduleStateStore:
+    """Durable scheduler state backed by the optional Redis integration."""
+
+    def __init__(
+        self,
+        *,
+        client: Any | None = None,
+        url: str | None = None,
+    ) -> None:
+        if client is None and url is None:
+            raise ValueError("Either client or url must be provided")
+        self._client = (
+            client
+            if client is not None
+            else _client_from_url(url, component="RedisScheduleStateStore")
+        )
+
+    def get(self, key: str) -> str | None:
+        value = self._client.get(key)
+        if value is None or isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        raise TypeError("Redis scheduler state must be bytes, str, or None")
+
+    def set(self, key: str, value: str) -> None:
+        self._client.set(key, value)
+
+
 class RedisTransport:
     """Redis transport for queue-based publish/consume flows.
 
@@ -25,21 +67,12 @@ class RedisTransport:
         if client is None and url is None:
             raise ValueError("Either client or url must be provided")
 
-        self._client = client or self._client_from_url(url)
+        self._client = (
+            client
+            if client is not None
+            else _client_from_url(url, component="RedisTransport")
+        )
         self.serializer = serializer or JsonSerializer()
-
-    @staticmethod
-    def _client_from_url(url: str | None) -> Any:
-        if url is None:
-            raise ValueError("A Redis url is required when client is not provided")
-
-        try:
-            redis = import_module("redis")
-        except ModuleNotFoundError as exc:  # pragma: no cover - import safety
-            raise RuntimeError(
-                "redis is required to build a RedisTransport from a url"
-            ) from exc
-        return redis.StrictRedis.from_url(url)
 
     def publish(self, channel: str, message: bytes) -> None:
         self._client.lpush(channel, message)
@@ -109,6 +142,7 @@ def decode_trusted_legacy_redis_payload(payload: bytes | str) -> Any:
 
 
 __all__ = [
+    "RedisScheduleStateStore",
     "RedisTransport",
     "decode_json_redis_payload",
     "decode_legacy_redis_payload",
