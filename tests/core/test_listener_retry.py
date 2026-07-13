@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
@@ -21,6 +24,17 @@ class RecordingTransport(MemoryTransport):
     def consume(self, channel: str, timeout: int = 5) -> bytes | None:
         self.consume_calls.append((channel, timeout))
         return super().consume(channel, timeout=timeout)
+
+
+class MutableClock:
+    def __init__(self) -> None:
+        self.current = datetime(2026, 7, 13, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.current
+
+    def advance(self, seconds: int) -> None:
+        self.current += timedelta(seconds=seconds)
 
 
 def test_listener_retries_failed_message_before_dead_letter() -> None:
@@ -259,3 +273,373 @@ def test_failed_batch_retries_then_dead_letters_with_audit_identity() -> None:
     assert dead_letter.headers["actor_id"] == 9
     assert dead_letter.headers["retries"] == 1
     assert dead_letter.headers["dead_lettered_from"] == "batched:audit.log"
+
+
+def test_failed_batch_retry_limit_is_exact_and_failed_queue_is_terminal() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    clock = MutableClock()
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+        dead_letter_channel=DEFAULT_FAILED_QUEUE_NAME,
+        now_fn=clock,
+    )
+    attempts: list[list[str]] = []
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=5, retry_limit=2)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        attempts.append([message.payload["entry"] for message in messages])
+        raise RuntimeError("batch unavailable")
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    for message_id in ("msg-1", "msg-2"):
+        transport.publish(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="audit.log",
+                    payload={"entry": message_id},
+                    headers={"tenant_id": 42},
+                    correlation_id="corr-1",
+                    causation_id="cause-1",
+                ).to_envelope(message_id=message_id)
+            ),
+        )
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+    assert len(attempts) == 1
+
+    clock.advance(5)
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+    clock.advance(5)
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert len(attempts) == 3
+    assert transport.size("batched:audit.log") == 0
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 2
+
+    terminal = [
+        MessageEnvelope.from_dict(
+            serializer.loads(transport.consume(DEFAULT_FAILED_QUEUE_NAME))
+        )
+        for _ in range(2)
+    ]
+    assert {envelope.message_id for envelope in terminal} == {"msg-1", "msg-2"}
+    assert {envelope.headers["retries"] for envelope in terminal} == {2}
+    assert {envelope.headers["tenant_id"] for envelope in terminal} == {42}
+    assert {envelope.correlation_id for envelope in terminal} == {"corr-1"}
+    assert {envelope.causation_id for envelope in terminal} == {"cause-1"}
+
+    for envelope in terminal:
+        transport.publish(DEFAULT_FAILED_QUEUE_NAME, serializer.dump(envelope))
+    assert listener.listen_once(DEFAULT_FAILED_QUEUE_NAME) is None
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 2
+    assert len(attempts) == 3
+
+
+@pytest.mark.parametrize(
+    "payload_retry,header_retry",
+    [(0, 2), ("not-a-count", 2), (-1, 2), (True, 2)],
+)
+def test_batch_header_retry_count_cannot_be_reset_by_payload_metadata(
+    payload_retry: object,
+    header_retry: int,
+) -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+    )
+    attempts = 0
+
+    @batched_event_handler("audit.log", batch_size=1, max_wait=0, retry_limit=2)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError(messages[0].message_type)
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log",
+                payload={"entry": "one", "retries": payload_retry},
+                headers={"retries": header_retry},
+            ).to_envelope(message_id="msg-conflict")
+        ),
+    )
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert attempts == 1
+    assert transport.size("batched:audit.log") == 0
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+
+
+def test_valid_header_retry_count_is_canonical_over_higher_payload_count() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+
+    @batched_event_handler("audit.log", batch_size=1, max_wait=0, retry_limit=2)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        raise RuntimeError(messages[0].message_type)
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log",
+                payload={"entry": "one", "retries": 99},
+                headers={"retries": 0},
+            ).to_envelope(message_id="msg-header-canonical")
+        ),
+    )
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    retried = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume("batched:audit.log"))
+    )
+    assert retried.headers["retries"] == 1
+    assert retried.payload["retries"] == 1
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 0
+
+
+def test_failed_batch_partitions_retryable_and_exhausted_envelopes() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+    )
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=0, retry_limit=2)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        raise RuntimeError(messages[0].message_type)
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    for message_id, retries in (("retryable", 1), ("exhausted", 2)):
+        envelope = EventMessage(
+            message_type="audit.log",
+            payload={"entry": message_id},
+            headers={"retries": retries},
+        ).to_envelope(message_id=message_id)
+        transport.publish("batched:audit.log", serializer.dump(envelope))
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert transport.size("batched:audit.log") == 1
+    retryable = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume("batched:audit.log"))
+    )
+    assert retryable.message_id == "retryable"
+    assert retryable.headers["retries"] == 2
+    exhausted = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_FAILED_QUEUE_NAME))
+    )
+    assert exhausted.message_id == "exhausted"
+    assert exhausted.headers["retries"] == 2
+
+
+@pytest.mark.parametrize(
+    "handler_limit,policy_limit,expected_attempts",
+    [(0, 5, 1), (None, 2, 3)],
+)
+def test_batch_retry_limit_zero_and_listener_default_are_exact(
+    handler_limit: int | None,
+    policy_limit: int,
+    expected_attempts: int,
+) -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=policy_limit),
+    )
+    attempts = 0
+
+    @batched_event_handler(
+        "audit.log",
+        batch_size=1,
+        max_wait=0,
+        retry_limit=handler_limit,
+    )
+    def fail_batch(messages: list[EventMessage]) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError(messages[0].message_type)
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log",
+                payload={"entry": "one"},
+            ).to_envelope()
+        ),
+    )
+
+    for _ in range(expected_attempts):
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert attempts == expected_attempts
+    assert transport.size("batched:audit.log") == 0
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+
+
+def test_malformed_batch_item_is_terminal_without_losing_valid_sibling() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    handled: list[str] = []
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=0)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        handled.extend(message.payload["entry"] for message in messages)
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    valid = serializer.dump(
+        EventMessage(
+            message_type="audit.log",
+            payload={"entry": "valid"},
+        ).to_envelope(message_id="valid-msg")
+    )
+    malformed = b"not-json"
+    transport.publish("batched:audit.log", valid)
+    transport.publish("batched:audit.log", malformed)
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert handled == ["valid"]
+    assert transport.size("batched:audit.log") == 0
+    poison = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_FAILED_QUEUE_NAME))
+    )
+    assert poison.message_type == "pybus.message.decode_failed"
+    assert poison.headers == {"dead_lettered_from": "batched:audit.log"}
+    assert poison.payload["raw_message_encoding"] == "base64"
+    assert poison.payload["error_type"] == "DeserializationError"
+    assert base64.b64decode(poison.payload["raw_message"]) == malformed
+    assert poison.content_encoding is None
+
+
+@pytest.mark.parametrize(
+    "payload_last_attempt", ["malformed", "2020-01-01T00:00:00+00:00"]
+)
+def test_valid_header_last_attempt_is_canonical_for_retry_delay(
+    payload_last_attempt: str,
+) -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    clock = MutableClock()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        now_fn=clock,
+    )
+
+    @event_handler("audit.log", delay=10)
+    def handle_event(message: EventMessage) -> None:
+        return None
+
+    registry.register("event", "audit.log", handle_event)
+    envelope = EventMessage(
+        message_type="audit.log",
+        payload={"entry": "one", "last_attempt": payload_last_attempt},
+        headers={"last_attempt": clock.current.isoformat()},
+    ).to_envelope()
+
+    assert listener._should_delay(envelope, listener._spec_for(handle_event)) is True
+
+
+def test_batch_retry_bound_survives_listener_restart() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    attempts = 0
+
+    @batched_event_handler("audit.log", batch_size=1, max_wait=0, retry_limit=1)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError(messages[0].message_type)
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    first_listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="audit.log",
+                payload={"entry": "one"},
+            ).to_envelope()
+        ),
+    )
+
+    first_listener.listen_once(DEFAULT_QUEUE_NAME)
+    restarted_listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    restarted_listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert attempts == 2
+    assert transport.size("batched:audit.log") == 0
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+
+
+def test_naive_header_last_attempt_falls_back_without_consuming_retry() -> None:
+    clock = MutableClock()
+    listener = Listener(
+        transport=MemoryTransport(),
+        serializer=JsonSerializer(),
+        now_fn=clock,
+    )
+
+    @event_handler("audit.log", delay=10)
+    def handle_event(message: EventMessage) -> None:
+        return None
+
+    envelope = EventMessage(
+        message_type="audit.log",
+        payload={"last_attempt": clock.current.isoformat()},
+        headers={"last_attempt": "2026-07-13T00:00:00"},
+    ).to_envelope()
+
+    assert listener._should_delay(envelope, listener._spec_for(handle_event)) is True

@@ -194,6 +194,19 @@ Default behavior:
 - exhausted retries should go to dead-letter handling
 - handler registrations should be process-local and deterministic
 
+Retry limits count additional delivery attempts: `retry_limit=0` means one
+initial handler invocation and no retry; `retry_limit=2` permits at most three
+handler invocations. Envelope headers are the canonical framework retry state:
+a valid header count wins. Legacy mapping payload fields are used only when the
+header is absent or malformed and may mirror the canonical value when requeued.
+Retry timestamps must include a UTC offset; a naive or malformed header timestamp
+is ignored and the listener may fall back to a valid legacy payload timestamp.
+
+Batched delivery currently supports one batched handler per message type. A
+batched handler may not share its message type with another batched or ordinary
+event handler because the buffer is claimed as one delivery unit. Registration
+must fail explicitly instead of silently losing fan-out deliveries.
+
 ---
 
 ## 4. Command Contract
@@ -357,6 +370,33 @@ Required behavior:
 - call handlers with typed message instances
 - apply retry policy
 - support dead-letter routing
+
+The configured dead-letter channel is terminal storage, not an ordinary input
+channel. Normal listener polling must leave it untouched so exhausted messages
+cannot re-enter the handler and exceed their retry bound. A future explicit
+redrive API may move selected messages back to an input queue.
+
+This is an intentional native-pybus boundary. A migration compatibility adapter
+may explicitly consume legacy failed-queue retries, but it must not configure the
+native listener's terminal dead-letter channel as an ordinary worker input.
+
+If a claimed batch member cannot be decoded, the listener writes a terminal
+`pybus.message.decode_failed` envelope with this payload and header contract:
+
+```json
+{
+  "payload": {
+    "raw_message": "<base64 text>",
+    "raw_message_encoding": "base64",
+    "error_type": "DeserializationError"
+  },
+  "headers": {"dead_lettered_from": "batched:<message_type>"}
+}
+```
+
+The envelope's `content_encoding` remains unset because only the nested raw
+message field is base64 encoded. Valid siblings from the same claimed batch must
+continue to their handler.
 
 The listener should preserve the current worker model defaults:
 

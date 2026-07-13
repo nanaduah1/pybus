@@ -78,6 +78,12 @@ The following compatibility rules must be preserved:
 - handler delay defaults to `0`
 - failed events should route to the failed queue
 - retry payloads should preserve `retries` and `last_attempt`
+- a retry limit of `N` allows `N` retries after the initial attempt
+- a valid envelope header is canonical when payload and header retry metadata
+  differ; payload metadata is a legacy fallback only when the header is absent
+  or malformed
+- exhausted messages are terminal in the failed queue and are not dispatched by
+  ordinary listener polling
 
 ### 2.5 Batching semantics
 
@@ -87,6 +93,16 @@ The batching contract must preserve:
 - default batch size of `100`
 - default max wait of `10`
 - requeue-on-failure behavior with retry counts
+- deterministic partitioning of mixed batches: eligible envelopes are requeued
+  while exhausted envelopes are dead-lettered exactly once
+- one batched handler per message type until per-handler buffer identities are
+  introduced; conflicting registrations fail explicitly
+- malformed batch members become terminal decode-failure records without
+  discarding valid siblings from the same claimed batch
+
+Native pybus treats its dead-letter channel as terminal. During migration, only
+an explicit compatibility/redrive adapter may consume legacy failed-queue
+retries; the native listener must not be pointed at that queue as ordinary work.
 
 ---
 

@@ -26,6 +26,15 @@ class Registry:
         key = (message_kind, message_type)
         handlers = self._handlers.setdefault(key, [])
 
+        if handlers and (
+            self._is_batched(handler)
+            or any(self._is_batched(existing) for existing in handlers)
+        ):
+            raise ValueError(
+                f"A batched handler already registered for "
+                f"{message_kind}:{message_type}"
+            )
+
         if not allow_multiple and handlers:
             raise ValueError(
                 f"Handler already registered for {message_kind}:{message_type}"
@@ -33,6 +42,14 @@ class Registry:
 
         handlers.append(handler)
         return handler
+
+    @staticmethod
+    def _is_batched(handler: Handler) -> bool:
+        spec = getattr(handler, "__pybus_handler_spec__", None)
+        if spec is None:
+            func = getattr(handler, "__func__", None)
+            spec = getattr(func, "__pybus_handler_spec__", None)
+        return bool(spec is not None and getattr(spec, "is_batched", False))
 
     def handlers_for(self, message_kind: str, message_type: str) -> tuple[Handler, ...]:
         return tuple(self._handlers.get((message_kind, message_type), ()))
