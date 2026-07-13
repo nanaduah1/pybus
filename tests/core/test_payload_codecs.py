@@ -14,6 +14,7 @@ from pybus.codecs import CODEC_KEY, PayloadTypeRegistry, PythonPayloadCodec
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import DeserializationError, SerializationError
 from pybus.handlers import batched_event_handler
+from pybus.retries import RetryPolicy
 from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
 
@@ -224,6 +225,51 @@ def test_codec_wraps_application_mapping_with_codec_marker() -> None:
         "value": payload,
     }
     assert codec.decode(encoded) == payload
+
+
+def test_retry_metadata_survives_wrapped_application_headers() -> None:
+    transport = MemoryTransport()
+    bus = Pybus(transport=transport)
+    bus.listener.retry_policy = RetryPolicy(max_retries=1)
+    attempts: list[dict[str, object]] = []
+    application_headers = {
+        CODEC_KEY: "business_rule",
+        "version": True,
+        "value": "keep-me",
+    }
+
+    def fail(message: EventMessage) -> None:
+        attempts.append(dict(message.headers))
+        raise RuntimeError("retry")
+
+    bus.dispatcher.registry.register("event", "rules.failed", fail)
+    bus.publish_event(
+        EventMessage(
+            message_type="rules.failed",
+            payload="scalar-payload",
+            headers=application_headers,
+        )
+    )
+
+    bus.listen_once(bus.topology.default_queue)
+    bus.listen_once(bus.topology.default_queue)
+
+    assert attempts[0] == application_headers
+    assert attempts[1][CODEC_KEY] == "business_rule"
+    assert attempts[1]["version"] is True
+    assert attempts[1]["value"] == "keep-me"
+    assert attempts[1]["retries"] == 1
+    assert "last_attempt" in attempts[1]
+
+    raw_dead_letter = transport.consume(bus.listener.dead_letter_channel)
+    assert raw_dead_letter is not None
+    dead_letter = bus.dispatcher.decode(
+        MessageEnvelope.from_dict(JsonSerializer().loads(raw_dead_letter))
+    )
+    assert dead_letter.headers[CODEC_KEY] == "business_rule"
+    assert dead_letter.headers["retries"] == 1
+    assert "last_attempt" in dead_letter.headers
+    assert dead_letter.headers["dead_lettered_from"] == bus.topology.default_queue
 
 
 def test_codec_rejects_unknown_codec_owned_type_marker() -> None:

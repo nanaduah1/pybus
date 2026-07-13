@@ -143,7 +143,9 @@ encodings remain readable during migration; unknown legacy marker values are
 ordinary application JSON and round-trip unchanged.
 Application mappings containing `__pybus_codec__` are encoded through a
 versioned mapping wrapper, including when nested, so the reserved codec key
-cannot collide with ordinary payload data.
+cannot collide with ordinary payload data. Framework retry and dead-letter
+metadata added to the wrapper remains visible after the application mapping is
+decoded.
 
 Producers and consumers must register allowed dataclass types through
 `PayloadTypeRegistry`.

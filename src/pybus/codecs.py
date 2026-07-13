@@ -152,10 +152,18 @@ class PythonPayloadCodec:
                 encoded_mapping = value.get("value")
                 if not isinstance(encoded_mapping, dict):
                     raise DeserializationError("Invalid payload mapping encoding")
-                return {
+                decoded_mapping = {
                     key: self.decode(inner, context=context)
                     for key, inner in encoded_mapping.items()
                 }
+                decoded_mapping.update(
+                    {
+                        key: self.decode(inner, context=context)
+                        for key, inner in value.items()
+                        if key not in {CODEC_KEY, "version", "value"}
+                    }
+                )
+                return decoded_mapping
             if value_kind == "decimal":
                 encoded_decimal = value.get("value")
                 if not isinstance(encoded_decimal, str):
