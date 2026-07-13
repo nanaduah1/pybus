@@ -92,7 +92,7 @@ The framework should provide the following by default:
 
 The framework should make the reliability model visible and boring:
 
-- at-least-once delivery
+- bounded in-process retries and terminal dead-lettering
 - retry on transient failure
 - dead-letter on exhaustion
 - explicit correlation for request/response
@@ -165,3 +165,34 @@ without building a custom bus:
 
 If those answers require copy-pasting the old application framework, then the
 extraction is still incomplete.
+
+## 7. Worker lifecycle
+
+Applications start a reusable worker from their configured bus:
+
+```python
+worker = bus.create_worker(
+    hooks=[DjangoConnectionCleanupHook()],
+    error_delay=1.0,
+)
+worker.run()
+```
+
+The framework owns lifecycle ordering, cooperative stop behavior, recovery
+after ordinary cycle errors, and terminal handling for malformed messages.
+Applications may add hooks for framework integration concerns, but should not
+need a custom listener subclass or process loop. Signal registration and
+process supervision remain application-owned.
+
+Known pre-claim polling errors are recoverable. Redis destructive-pop errors,
+and settlement encoding or publication failures after consumption, raise
+`IndeterminateDeliveryError` and abort the worker so later messages are not
+drained through the same outage. An indeterminate batch claim can affect every
+member already removed by that claim.
+
+The current Redis list transport provides bounded handler retries during a
+running process, but it does not yet provide claim/ack crash recovery. A crash
+or indeterminate publication outcome can still lose the claimed message even
+though the worker fails closed. Consumers that require crash-safe at-least-once
+delivery must wait for or provide the durability track rather than infer that
+guarantee from `Worker`.

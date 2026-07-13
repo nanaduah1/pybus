@@ -10,6 +10,7 @@ from pybus.bus import (
 )
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
+from pybus.exceptions import IndeterminateDeliveryError
 from pybus.handlers import (
     ContinueProcessing,
     HandlerSpec,
@@ -48,6 +49,7 @@ from pybus.scheduling import (
     get_scheduler,
     scheduled,
 )
+from pybus.worker import Worker, WorkerHook
 
 __all__ = [
     "BaseMessage",
@@ -61,6 +63,7 @@ __all__ = [
     "Dispatcher",
     "EventMessage",
     "InboxStore",
+    "IndeterminateDeliveryError",
     "JsonSerializer",
     "get_bus",
     "ContinueProcessing",
@@ -94,4 +97,6 @@ __all__ = [
     "declare_queues",
     "send_command",
     "Transport",
+    "Worker",
+    "WorkerHook",
 ]

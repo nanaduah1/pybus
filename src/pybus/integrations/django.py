@@ -4,6 +4,37 @@ from importlib import import_module
 from typing import Any, Callable
 
 from pybus.queues import DEFAULT_QUEUE_NAME
+from pybus.worker import Worker, WorkerHook
+
+
+class DjangoConnectionCleanupHook(WorkerHook):
+    """Close obsolete Django connections around worker polling."""
+
+    def __init__(
+        self,
+        *,
+        close_connections_fn: Callable[[], None] | None = None,
+    ) -> None:
+        self._close_connections = close_connections_fn or self._load_close_connections()
+
+    @staticmethod
+    def _load_close_connections() -> Callable[[], None]:
+        try:
+            django_db = import_module("django.db")
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Django is required to use DjangoConnectionCleanupHook"
+            ) from exc
+        return django_db.close_old_connections
+
+    def before_poll(self, worker: Worker) -> None:
+        self._close_connections()
+
+    def after_poll(self, worker: Worker, result: object | None) -> None:
+        self._close_connections()
+
+    def on_stop(self, worker: Worker) -> None:
+        self._close_connections()
 
 
 class DjangoBusAdapter:

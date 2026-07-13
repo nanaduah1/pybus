@@ -8,7 +8,7 @@ import pytest
 from pybus.bus import Pybus
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
-from pybus.exceptions import MessageTimeoutError
+from pybus.exceptions import IndeterminateDeliveryError, MessageTimeoutError
 from pybus.listener import DEFAULT_QUEUE_NAME, Listener
 from pybus.messages import EventMessage, RequestMessage, ResponseMessage
 from pybus.queues import QueueTopology
@@ -16,6 +16,7 @@ from pybus.registry import Registry
 from pybus.request_response import DEFAULT_REPLY_QUEUE
 from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
+from pybus.worker import Worker
 
 
 class PublishFailureTransport(MemoryTransport):
@@ -27,6 +28,13 @@ class PublishFailureTransport(MemoryTransport):
         if channel == self.fail_channel:
             raise RuntimeError(f"failed to publish to {channel}")
         super().publish(channel, message)
+
+
+class ResponseSerializationFailure(JsonSerializer):
+    def dump(self, value) -> bytes:
+        if isinstance(value, MessageEnvelope) and value.message_kind == "response":
+            raise TypeError("response cannot be serialized")
+        return super().dump(value)
 
 
 def test_listener_publishes_response_for_request_handlers() -> None:
@@ -92,13 +100,51 @@ def test_listener_does_not_retry_processed_request_when_response_publish_fails()
     ).to_envelope(message_id="req-1")
 
     transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(request_envelope))
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(request_envelope))
 
-    with pytest.raises(RuntimeError, match="failed to publish"):
-        listener.listen_once(DEFAULT_QUEUE_NAME)
+    with pytest.raises(IndeterminateDeliveryError, match="response publication"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
 
-    assert transport.size(DEFAULT_QUEUE_NAME) == 0
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
     assert transport.size(DEFAULT_REPLY_QUEUE) == 0
     assert transport.size(listener.dead_letter_channel) == 0
+
+
+def test_worker_aborts_when_response_serialization_fails_after_handler() -> None:
+    registry = Registry()
+    transport = MemoryTransport()
+    serializer = ResponseSerializationFailure()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    handled: list[str] = []
+
+    def handle_request(message: RequestMessage) -> ResponseMessage:
+        handled.append(message.payload["invoice_id"])
+        return ResponseMessage(
+            message_type="billing.get_invoice.response",
+            payload={"invoice_id": message.payload["invoice_id"]},
+        )
+
+    registry.register("request", "billing.get_invoice", handle_request)
+    for invoice_id in ("INV-1", "INV-2"):
+        transport.publish(
+            DEFAULT_QUEUE_NAME,
+            JsonSerializer().dump(
+                RequestMessage(
+                    message_type="billing.get_invoice",
+                    payload={"invoice_id": invoice_id},
+                ).to_envelope(message_id=invoice_id)
+            ),
+        )
+
+    with pytest.raises(IndeterminateDeliveryError, match="response publication"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert handled == ["INV-1"]
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
 def test_bus_request_waits_for_matching_response() -> None:
@@ -266,3 +312,21 @@ def test_bus_can_route_through_app_mapped_default_queue() -> None:
 
     assert envelope.message_type == "student.enrolled"
     assert transport.size("skuulbe.jobs") == 1
+
+
+def test_bus_creates_worker_for_default_or_explicit_channel() -> None:
+    bus = Pybus(MemoryTransport())
+
+    default_worker = bus.create_worker()
+    slow_worker = bus.create_worker(bus.topology.slow_queue)
+
+    assert isinstance(default_worker, Worker)
+    assert default_worker.channel == bus.topology.default_queue
+    assert slow_worker.channel == bus.topology.slow_queue
+
+
+def test_bus_refuses_worker_for_terminal_dead_letter_queue() -> None:
+    bus = Pybus(MemoryTransport())
+
+    with pytest.raises(ValueError, match="dead-letter channel is terminal"):
+        bus.create_worker(bus.topology.dead_letter_queue)

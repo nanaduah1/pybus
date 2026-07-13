@@ -146,6 +146,29 @@ This should only happen after a versioned deprecation period.
 Outbox/inbox flows should be treated as a durability upgrade path, not as a
 new core capability in v1.
 
+For worker bootstrap migration, replace custom listener subclasses and polling
+loops with `bus.create_worker(...)`. Use lifecycle hooks for integration cleanup;
+for Django workers, add `DjangoConnectionCleanupHook`. Keep signal registration
+and process supervision in the host application. Do not configure the terminal
+dead-letter queue as worker input.
+
+```python
+from pybus.integrations.django import DjangoConnectionCleanupHook
+
+default_worker = bus.create_worker(
+    hooks=[DjangoConnectionCleanupHook()],
+)
+slow_worker = bus.create_worker(
+    bus.topology.slow_queue,
+    hooks=[DjangoConnectionCleanupHook()],
+)
+```
+
+The host application starts and supervises these blocking workers separately
+and owns thread/process and signal handling. It must not start a native worker
+for `bus.topology.dead_letter_queue`; failed work remains terminal until an
+explicit redrive operation is introduced.
+
 ---
 
 ## 9. Safety Checklist

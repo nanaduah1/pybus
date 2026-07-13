@@ -132,7 +132,7 @@ transport track, not to the base envelope model.
 | Wire format | Pickle | JSON |
 | Transaction deferral | `transaction.on_commit` | Same behavior via Django extra |
 | Handler registry | Global module registry | Registry object with compatibility facade |
-| Worker loop | Process-local listener | Listener abstraction with optional Redis transport |
+| Worker loop | Process-local listener | `Worker` around `Listener`, with optional Django cleanup hook and Redis transport |
 | Batch buffering | Redis list per event type | Same behavior exposed through transport/store adapters |
 | Request/response | Not present | New capability, no legacy breakage |
 
@@ -165,10 +165,13 @@ The new package should eventually expose shims that map:
 - `BatchedEventPublisher` -> batching-aware publisher facade
 - `event_handler` -> registry registration helper
 - `batched_event_handler` -> batched registration helper
-- `EventListener` -> listener facade
+- `EventListener` -> `Worker` plus `Listener` composition; use the optional
+  Django cleanup hook where database connections are involved
 - `ContinueProcess` -> flow control response object
 
 The shims are migration scaffolding. They should make the downstream codebase
 feel familiar while the core repo stays focused on the new public contracts.
 
 These shims are temporary and should be clearly marked deprecated when used.
+Native `Worker` input must never include the terminal failed queue; legacy
+failed-queue processing requires an explicit compatibility/redrive adapter.

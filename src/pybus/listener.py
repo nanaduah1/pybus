@@ -8,7 +8,7 @@ import time
 from pybus.batching import batched_buffer_key
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
-from pybus.exceptions import HandlerNotFoundError
+from pybus.exceptions import HandlerNotFoundError, IndeterminateDeliveryError
 from pybus.handlers import ContinueProcessing, HandlerSpec, _handler_spec
 from pybus.messages import RequestMessage, ResponseMessage
 from pybus.queues import (
@@ -61,6 +61,8 @@ class Listener:
 
         try:
             result = self._dispatch(channel_name, envelope)
+        except IndeterminateDeliveryError:
+            raise
         except HandlerNotFoundError:
             self._dead_letter(channel_name, envelope)
             return None
@@ -110,7 +112,11 @@ class Listener:
             raw_message = self.transport.consume(channel_name, timeout=consume_timeout)
             if raw_message is None:
                 continue
-            envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))
+            try:
+                envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))
+            except Exception as exc:
+                self._dead_letter_undecodable(channel_name, raw_message, exc)
+                return channel_name, None
             return channel_name, envelope
         return None, None
 
@@ -195,7 +201,12 @@ class Listener:
         continuation: ContinueProcessing,
     ) -> None:
         target_queue = continuation.queue or channel_name
-        self.transport.publish(target_queue, self.serializer.dump(envelope))
+        self._settle_after_claim(
+            "continuation",
+            lambda: self.transport.publish(
+                target_queue, self.serializer.dump(envelope)
+            ),
+        )
 
     def _flush_ready_batches(self) -> None:
         if not hasattr(self.transport, "size") or not hasattr(
@@ -243,7 +254,10 @@ class Listener:
         buffer_key = batched_buffer_key(message_type)
         if self.transport.size(buffer_key) == 0:
             self._batch_started_at[message_type] = self._now_fn()
-        self.transport.publish(buffer_key, self.serializer.dump(envelope))
+        self._settle_after_claim(
+            "batch buffering",
+            lambda: self.transport.publish(buffer_key, self.serializer.dump(envelope)),
+        )
 
     def _flush_batch(
         self,
@@ -318,48 +332,54 @@ class Listener:
         headers = dict(envelope.headers)
         headers["retries"] = retries + 1
         headers["last_attempt"] = now.isoformat()
-        self.transport.publish(
-            channel_name,
-            self.serializer.dump(
-                MessageEnvelope.create(
-                    message_id=envelope.message_id,
-                    message_type=envelope.message_type,
-                    message_kind=envelope.message_kind,
-                    version=envelope.version,
-                    payload=payload,
-                    headers=headers,
-                    created_at=envelope.created_at,
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.causation_id,
-                    reply_to=envelope.reply_to,
-                    expires_at=envelope.expires_at,
-                    content_type=envelope.content_type,
-                    content_encoding=envelope.content_encoding,
-                )
+        self._settle_after_claim(
+            "retry requeue",
+            lambda: self.transport.publish(
+                channel_name,
+                self.serializer.dump(
+                    MessageEnvelope.create(
+                        message_id=envelope.message_id,
+                        message_type=envelope.message_type,
+                        message_kind=envelope.message_kind,
+                        version=envelope.version,
+                        payload=payload,
+                        headers=headers,
+                        created_at=envelope.created_at,
+                        correlation_id=envelope.correlation_id,
+                        causation_id=envelope.causation_id,
+                        reply_to=envelope.reply_to,
+                        expires_at=envelope.expires_at,
+                        content_type=envelope.content_type,
+                        content_encoding=envelope.content_encoding,
+                    )
+                ),
             ),
         )
 
     def _dead_letter(self, channel_name: str, envelope: MessageEnvelope) -> None:
         headers = dict(envelope.headers)
         headers["dead_lettered_from"] = channel_name
-        self.transport.publish(
-            self.dead_letter_channel,
-            self.serializer.dump(
-                MessageEnvelope.create(
-                    message_id=envelope.message_id,
-                    message_type=envelope.message_type,
-                    message_kind=envelope.message_kind,
-                    version=envelope.version,
-                    payload=envelope.payload,
-                    headers=headers,
-                    created_at=envelope.created_at,
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.causation_id,
-                    reply_to=envelope.reply_to,
-                    expires_at=envelope.expires_at,
-                    content_type=envelope.content_type,
-                    content_encoding=envelope.content_encoding,
-                )
+        self._settle_after_claim(
+            "dead-letter publication",
+            lambda: self.transport.publish(
+                self.dead_letter_channel,
+                self.serializer.dump(
+                    MessageEnvelope.create(
+                        message_id=envelope.message_id,
+                        message_type=envelope.message_type,
+                        message_kind=envelope.message_kind,
+                        version=envelope.version,
+                        payload=envelope.payload,
+                        headers=headers,
+                        created_at=envelope.created_at,
+                        correlation_id=envelope.correlation_id,
+                        causation_id=envelope.causation_id,
+                        reply_to=envelope.reply_to,
+                        expires_at=envelope.expires_at,
+                        content_type=envelope.content_type,
+                        content_encoding=envelope.content_encoding,
+                    )
+                ),
             ),
         )
 
@@ -383,9 +403,11 @@ class Listener:
             },
             headers={"dead_lettered_from": channel_name},
         )
-        self.transport.publish(
-            self.dead_letter_channel,
-            self.serializer.dump(poison),
+        self._settle_after_claim(
+            "decode-failure publication",
+            lambda: self.transport.publish(
+                self.dead_letter_channel, self.serializer.dump(poison)
+            ),
         )
 
     def _publish_response(
@@ -393,21 +415,38 @@ class Listener:
         request_envelope: MessageEnvelope,
         response: ResponseMessage,
     ) -> None:
-        reply_queue = request_envelope.reply_to or DEFAULT_REPLY_QUEUE
-        codec = self.dispatcher.payload_codec
-        encoded_headers = codec.encode(response.headers)
-        response_envelope = MessageEnvelope.create(
-            message_type=response.message_type,
-            message_kind=response.message_kind,
-            version=response.version,
-            payload=codec.encode(response.payload, context=response.headers),
-            headers=encoded_headers,
-            created_at=datetime.now(timezone.utc),
-            correlation_id=request_envelope.correlation_id,
-            causation_id=request_envelope.message_id,
-            reply_to=reply_queue,
-            expires_at=response.expires_at,
-            content_type=response.content_type,
-            content_encoding=response.content_encoding,
-        )
-        self.transport.publish(reply_queue, self.serializer.dump(response_envelope))
+        def publish_response() -> None:
+            reply_queue = request_envelope.reply_to or DEFAULT_REPLY_QUEUE
+            codec = self.dispatcher.payload_codec
+            encoded_headers = codec.encode(response.headers)
+            response_envelope = MessageEnvelope.create(
+                message_type=response.message_type,
+                message_kind=response.message_kind,
+                version=response.version,
+                payload=codec.encode(response.payload, context=response.headers),
+                headers=encoded_headers,
+                created_at=datetime.now(timezone.utc),
+                correlation_id=request_envelope.correlation_id,
+                causation_id=request_envelope.message_id,
+                reply_to=reply_queue,
+                expires_at=response.expires_at,
+                content_type=response.content_type,
+                content_encoding=response.content_encoding,
+            )
+            self.transport.publish(reply_queue, self.serializer.dump(response_envelope))
+
+        self._settle_after_claim("response publication", publish_response)
+
+    def _settle_after_claim(
+        self,
+        action: str,
+        operation: Callable[[], None],
+    ) -> None:
+        try:
+            operation()
+        except IndeterminateDeliveryError:
+            raise
+        except Exception as exc:
+            raise IndeterminateDeliveryError(
+                f"{action} failed after a message was claimed from the transport"
+            ) from exc
