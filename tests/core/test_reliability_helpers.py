@@ -23,6 +23,25 @@ def test_retry_defaults_and_next_delay() -> None:
     assert policy.next_delay(2) == 0
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_retries": -1},
+        {"max_retries": True},
+        {"max_retries": 1.5},
+        {"delay": -1},
+        {"delay": True},
+        {"delay": "invalid"},
+        {"backoff_factor": -1},
+        {"backoff_factor": True},
+        {"backoff_factor": float("nan")},
+    ],
+)
+def test_retry_policy_rejects_invalid_options(options) -> None:
+    with pytest.raises(ValueError):
+        RetryPolicy(**options)
+
+
 def test_batch_buffer_flushes_on_size_and_tracks_key() -> None:
     buffer = BatchBuffer(event_type="student.enrolled", batch_size=2, max_wait=10)
 

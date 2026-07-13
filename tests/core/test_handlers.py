@@ -216,3 +216,34 @@ def test_batched_event_handler_marks_handler_metadata() -> None:
     assert spec.is_batched is True
     assert spec.batch_size == 25
     assert spec.max_wait == 30
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"batch_size": 0},
+        {"batch_size": -1},
+        {"max_wait": -1},
+        {"retry_limit": -1},
+    ],
+)
+def test_batched_event_handler_rejects_invalid_delivery_options(options) -> None:
+    with pytest.raises(ValueError):
+        batched_event_handler("student.enrolled", **options)
+
+
+def test_registry_rejects_multiple_batched_handlers_for_one_message_type() -> None:
+    registry = Registry()
+
+    @batched_event_handler("student.enrolled")
+    def first(messages: list[EventMessage]) -> None:
+        return None
+
+    @batched_event_handler("student.enrolled")
+    def second(messages: list[EventMessage]) -> None:
+        return None
+
+    registry.register("event", "student.enrolled", first, allow_multiple=True)
+
+    with pytest.raises(ValueError, match="batched handler already registered"):
+        registry.register("event", "student.enrolled", second, allow_multiple=True)

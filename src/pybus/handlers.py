@@ -80,6 +80,14 @@ def _decorate_handler(
     max_wait: int = 10,
     registry: Registry | None = None,
 ) -> Callable[[Handler], Handler]:
+    _validate_non_negative_integer("retry_limit", retry_limit, allow_none=True)
+    _validate_non_negative_integer("delay", delay)
+    if is_batched:
+        _validate_non_negative_integer("batch_size", batch_size)
+        _validate_non_negative_integer("max_wait", max_wait)
+        if batch_size == 0:
+            raise ValueError("batch_size must be greater than zero")
+
     resolved_kind, resolved_type = _resolve_message_binding(
         message,
         expected_kind=message_kind,
@@ -107,6 +115,18 @@ def _decorate_handler(
         return handler
 
     return decorator
+
+
+def _validate_non_negative_integer(
+    name: str,
+    value: int | None,
+    *,
+    allow_none: bool = False,
+) -> None:
+    if value is None and allow_none:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
 
 
 def event_handler(

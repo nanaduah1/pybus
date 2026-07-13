@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import base64
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 import time
 
@@ -16,7 +17,12 @@ from pybus.queues import (
     DEFAULT_SLOW_QUEUE_NAME as _DEFAULT_SLOW_QUEUE_NAME,
 )
 from pybus.request_response import DEFAULT_REPLY_QUEUE
-from pybus.retries import RetryPolicy, next_retry_payload
+from pybus.retries import (
+    RetryPolicy,
+    next_retry_payload,
+    resolve_last_attempt,
+    resolve_retry_count,
+)
 from pybus.serializer import JsonSerializer
 
 DEFAULT_QUEUE_NAME = _DEFAULT_QUEUE_NAME
@@ -33,18 +39,23 @@ class Listener:
         serializer: JsonSerializer | None = None,
         retry_policy: RetryPolicy | None = None,
         dead_letter_channel: str = DEFAULT_FAILED_QUEUE_NAME,
+        now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.transport = transport
         self.dispatcher = dispatcher or Dispatcher()
         self.serializer = serializer or JsonSerializer()
         self.retry_policy = retry_policy or RetryPolicy()
         self.dead_letter_channel = dead_letter_channel
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._batch_started_at: dict[str, datetime] = {}
         self._batch_retry_after: dict[str, datetime] = {}
 
     def listen_once(self, channel: str | Sequence[str]) -> object | None:
         self._flush_ready_batches()
-        channel_name, envelope = self._consume_envelope(channel)
+        active_channels = self._active_channels(channel)
+        if not active_channels:
+            return None
+        channel_name, envelope = self._consume_envelope(active_channels)
         if envelope is None:
             return None
 
@@ -65,6 +76,14 @@ class Listener:
         ):
             self._publish_response(envelope, result)
         return result
+
+    def _active_channels(self, channel: str | Sequence[str]) -> tuple[str, ...]:
+        channels = (channel,) if isinstance(channel, str) else tuple(channel)
+        return tuple(
+            channel_name
+            for channel_name in channels
+            if channel_name != self.dead_letter_channel
+        )
 
     def listen(
         self,
@@ -145,20 +164,11 @@ class Listener:
         if spec.delay <= 0:
             return False
 
-        last_attempt_raw = None
-        if isinstance(envelope.payload, dict):
-            last_attempt_raw = envelope.payload.get("last_attempt")
-        if last_attempt_raw is None:
-            last_attempt_raw = envelope.headers.get("last_attempt")
-        if not isinstance(last_attempt_raw, str):
+        last_attempt = resolve_last_attempt(envelope.payload, envelope.headers)
+        if last_attempt is None:
             return False
 
-        try:
-            last_attempt = datetime.fromisoformat(last_attempt_raw)
-        except ValueError:
-            return False
-
-        return (datetime.now(timezone.utc) - last_attempt).total_seconds() < spec.delay
+        return (self._now_fn() - last_attempt).total_seconds() < spec.delay
 
     def _handle_failed_delivery(
         self,
@@ -210,19 +220,18 @@ class Listener:
                     continue
                 started_at = self._batch_started_at.setdefault(
                     message_type,
-                    datetime.now(timezone.utc),
+                    self._now_fn(),
                 )
                 ready = (
                     buffer_size >= spec.batch_size
-                    or (datetime.now(timezone.utc) - started_at).total_seconds()
-                    >= spec.max_wait
+                    or (self._now_fn() - started_at).total_seconds() >= spec.max_wait
                 )
                 if ready:
                     self._flush_batch(message_type, handler, spec)
 
     def _batch_in_backoff(self, message_type: str) -> bool:
         retry_at = self._batch_retry_after.get(message_type)
-        return retry_at is not None and datetime.now(timezone.utc) < retry_at
+        return retry_at is not None and self._now_fn() < retry_at
 
     def _buffer_batched_message(
         self,
@@ -233,7 +242,7 @@ class Listener:
             return
         buffer_key = batched_buffer_key(message_type)
         if self.transport.size(buffer_key) == 0:
-            self._batch_started_at[message_type] = datetime.now(timezone.utc)
+            self._batch_started_at[message_type] = self._now_fn()
         self.transport.publish(buffer_key, self.serializer.dump(envelope))
 
     def _flush_batch(
@@ -247,11 +256,22 @@ class Listener:
         if not raw_messages:
             return
 
-        envelopes = [
-            MessageEnvelope.from_dict(self.serializer.loads(raw_message))
-            for raw_message in raw_messages
-        ]
-        events = [self.dispatcher.decode(envelope) for envelope in envelopes]
+        envelopes: list[MessageEnvelope] = []
+        events: list[object] = []
+        for raw_message in raw_messages:
+            try:
+                envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))
+                event = self.dispatcher.decode(envelope)
+            except Exception as exc:
+                self._dead_letter_undecodable(buffer_key, raw_message, exc)
+                continue
+            envelopes.append(envelope)
+            events.append(event)
+
+        if not events:
+            self._batch_started_at.pop(message_type, None)
+            self._batch_retry_after.pop(message_type, None)
+            return
         try:
             handler(events)
         except Exception:
@@ -268,9 +288,9 @@ class Listener:
                 else:
                     self._dead_letter(buffer_key, envelope)
             if requeued:
-                self._batch_retry_after[message_type] = datetime.now(
-                    timezone.utc
-                ) + timedelta(seconds=spec.max_wait)
+                self._batch_retry_after[message_type] = self._now_fn() + timedelta(
+                    seconds=spec.max_wait
+                )
             else:
                 self._batch_retry_after.pop(message_type, None)
             return
@@ -279,26 +299,24 @@ class Listener:
         self._batch_retry_after.pop(message_type, None)
 
     def _should_retry(self, envelope: MessageEnvelope) -> bool:
-        return self._retry_count(envelope) < self.retry_policy.max_retries
+        return self.retry_policy.should_retry(self._retry_count(envelope))
 
     def _retry_count(self, envelope: MessageEnvelope) -> int:
-        if isinstance(envelope.payload, dict):
-            value = envelope.payload.get("retries", 0)
-        else:
-            value = envelope.headers.get("retries", 0)
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+        return resolve_retry_count(envelope.payload, envelope.headers)
 
     def _requeue(self, channel_name: str, envelope: MessageEnvelope) -> None:
-        now = datetime.now(timezone.utc)
+        now = self._now_fn()
+        retries = self._retry_count(envelope)
         if isinstance(envelope.payload, dict):
-            payload = next_retry_payload(envelope.payload, attempted_at=now)
+            payload = next_retry_payload(
+                envelope.payload,
+                attempted_at=now,
+                retries=retries,
+            )
         else:
             payload = envelope.payload
         headers = dict(envelope.headers)
-        headers["retries"] = self._retry_count(envelope) + 1
+        headers["retries"] = retries + 1
         headers["last_attempt"] = now.isoformat()
         self.transport.publish(
             channel_name,
@@ -343,6 +361,31 @@ class Listener:
                     content_encoding=envelope.content_encoding,
                 )
             ),
+        )
+
+    def _dead_letter_undecodable(
+        self,
+        channel_name: str,
+        raw_message: bytes | str,
+        exception: Exception,
+    ) -> None:
+        raw_bytes = (
+            raw_message.encode("utf-8") if isinstance(raw_message, str) else raw_message
+        )
+        poison = MessageEnvelope.create(
+            message_type="pybus.message.decode_failed",
+            message_kind="event",
+            version=1,
+            payload={
+                "raw_message": base64.b64encode(raw_bytes).decode("ascii"),
+                "raw_message_encoding": "base64",
+                "error_type": type(exception).__name__,
+            },
+            headers={"dead_lettered_from": channel_name},
+        )
+        self.transport.publish(
+            self.dead_letter_channel,
+            self.serializer.dump(poison),
         )
 
     def _publish_response(
