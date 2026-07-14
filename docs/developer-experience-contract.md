@@ -124,8 +124,15 @@ domain.
 The target public shape should read like this:
 
 ```python
+from pybus.integrations.django import BusConfiguration
+
 topology = pybus.QueueTopology().declare_queues("student.lifecycle", "billing")
-bus = pybus.configure_transport(..., topology=topology)
+application_bus = BusConfiguration(
+    transport_factory=lambda: ...,
+    topology=topology,
+    handler_modules=("application.handlers",),
+)
+bus = application_bus.configure()
 
 
 @pybus.event("student.enrolled", queue="student.lifecycle")
@@ -187,10 +194,7 @@ extraction is still incomplete.
 Applications start a reusable worker from their configured bus:
 
 ```python
-worker = bus.create_worker(
-    hooks=[DjangoConnectionCleanupHook()],
-    error_delay=1.0,
-)
+worker = bus.create_worker(error_delay=1.0)
 worker.run()
 ```
 
@@ -199,6 +203,12 @@ after ordinary cycle errors, and terminal handling for malformed messages.
 Applications may add hooks for framework integration concerns, but should not
 need a custom listener subclass or process loop. Signal registration and
 process supervision remain application-owned.
+
+Reusable application composition may declare `worker_hook_factories` once.
+Each worker receives fresh hook instances. An explicit `hooks=` argument on
+`create_worker` replaces those defaults, and `hooks=()` disables them.
+The Django `BusConfiguration` import supplies connection cleanup by default;
+the core import remains framework-neutral.
 
 Known pre-claim polling errors are recoverable. Redis destructive-pop errors,
 and settlement encoding or publication failures after consumption, raise

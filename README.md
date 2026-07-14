@@ -82,6 +82,67 @@ from pybus.integrations.django import publish_event
 That function accepts the same event object. It publishes immediately outside
 an atomic block and defers through `transaction.on_commit` inside one.
 
+## Reusable application composition
+
+Declare transport, topology, handlers, and integration hooks once. The same
+configuration creates isolated buses for tests and workers or idempotently
+installs the process-default bus used by `publish_event` and `send_command`:
+
+```python
+from django.conf import settings
+
+from pybus import QueueTopology
+from pybus.integrations.django import BusConfiguration
+from pybus.integrations.redis import RedisTransport
+
+
+APPLICATION_BUS = BusConfiguration(
+    transport_factory=lambda: RedisTransport(url=settings.REDIS_URL),
+    topology=QueueTopology().declare_queue("student.lifecycle"),
+    handler_modules=("myapp.handlers",),
+)
+
+APPLICATION_BUS.configure()  # process default; safe to call repeatedly
+```
+
+Tests reuse those choices while replacing only the transport:
+
+```python
+from pybus.transports.memory import MemoryTransport
+
+test_bus = APPLICATION_BUS.create(transport=MemoryTransport())
+```
+
+Workers reuse the configured process bus:
+
+```python
+worker = APPLICATION_BUS.configure().create_worker()
+worker.run()
+```
+
+Constructing `BusConfiguration` does not create the transport or import handler
+modules. Each `create()` call builds a fresh registry and dispatcher. A
+successful `configure()` caches one bus for that configuration and reinstalls it
+as the process default if another low-level configuration temporarily replaced
+it. Failed transport creation, handler import, or registration is retryable and
+does not replace the current default bus.
+
+Handler module paths are explicit, imported in declaration order, and may be
+combined with concrete `handler_targets`. Worker hook factories create fresh
+hooks for each worker. Passing `hooks=` to `create_worker` replaces configured
+defaults; `hooks=()` explicitly disables them. Importing `BusConfiguration`
+from `pybus.integrations.django` enables fresh Django connection-cleanup hooks
+by default; pass `worker_hook_factories=()` to disable them. The core import has
+no framework hooks.
+
+`configure()` invokes the transport factory. Factories may construct lazy
+client objects but should not probe external infrastructure; the bundled Redis
+transport connects only when an operation is performed. Configure once in each
+worker process rather than sharing arbitrary client objects across a fork.
+
+`Pybus(...)` and `configure_transport(...)` remain available as low-level,
+backward-compatible APIs for callers that need to supply their own dispatcher.
+
 ## Rich nested payload values
 
 Top-level typed events and commands need no payload registration. Configure a
