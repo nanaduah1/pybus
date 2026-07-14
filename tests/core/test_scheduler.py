@@ -421,6 +421,8 @@ def test_successful_retry_clears_persisted_failure_state() -> None:
     [
         "not-json",
         '{"version": 2}',
+        '{"version": true, "last_run": null, "due": null, "failures": 0, "last_failure": null}',
+        '{"version": 1.0, "last_run": null, "due": null, "failures": 0, "last_failure": null}',
         '{"version": 1, "last_run": "not-a-time", "due": null, "failures": 0, "last_failure": null}',
         '{"version": 1, "last_run": "2026-07-13T12:00:00", "due": null, "failures": 0, "last_failure": null}',
     ],

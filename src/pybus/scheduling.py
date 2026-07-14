@@ -368,9 +368,13 @@ class Scheduler:
 
         try:
             data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("scheduler state must be a JSON object")
+            version = data.get("version")
             if (
-                not isinstance(data, dict)
-                or data.get("version") != _SCHEDULE_STATE_VERSION
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version != _SCHEDULE_STATE_VERSION
             ):
                 raise ValueError("unsupported state version")
             failures = data["failures"]
