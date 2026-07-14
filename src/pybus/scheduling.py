@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import time
 from typing import Any, Protocol
@@ -25,6 +26,17 @@ class InMemoryScheduleStateStore:
         self._values[key] = value
 
 
+_SCHEDULE_STATE_VERSION = 1
+
+
+@dataclass(frozen=True)
+class _PersistedScheduleState:
+    last_run: datetime | None
+    due: datetime | None
+    failures: int
+    last_failure: datetime | None
+
+
 @dataclass
 class ScheduledTask:
     name: str
@@ -38,6 +50,7 @@ class ScheduledTask:
     failures: int = 0
     last_failure: datetime | None = None
     last_run: datetime | None = None
+    identity: str | None = None
 
 
 class Scheduler:
@@ -49,7 +62,9 @@ class Scheduler:
         now_fn: Callable[[], datetime] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
-        self.state_store = state_store or InMemoryScheduleStateStore()
+        self.state_store = (
+            state_store if state_store is not None else InMemoryScheduleStateStore()
+        )
         self.logger = logger or logging.getLogger("pybus.scheduler")
         self._now_fn = now_fn or self._default_now
         self._sleep_fn = sleep_fn or time.sleep
@@ -63,27 +78,53 @@ class Scheduler:
         days: Sequence[int] | None = None,
         hour: int | None = None,
         minute: int | None = None,
+        identity: str | None = None,
         **options: Any,
     ) -> Callable[[Callable[[], object]], Callable[[], object]]:
         def decorator(func: Callable[[], object]) -> Callable[[], object]:
+            task_identity = self._resolve_identity(func, identity)
+            if task_identity in self._tasks:
+                raise ValueError(f"Duplicate scheduled task identity: {task_identity}")
+
+            persisted = self._read_state(task_identity)
+            current = self._require_aware_datetime(
+                self._now_fn(),
+                label="Scheduler clock",
+            )
+            last_run = persisted.last_run if persisted is not None else None
+            due = (
+                persisted.due
+                if (
+                    persisted is not None
+                    and persisted.failures > 0
+                    and persisted.due is not None
+                )
+                else self._initial_due_time(
+                    current=current,
+                    interval=interval,
+                    days=days,
+                    hour=hour,
+                    minute=minute,
+                    last_run=last_run,
+                )
+            )
             task = ScheduledTask(
                 name=func.__name__,
                 func=func,
+                identity=task_identity,
                 interval=interval,
                 days=tuple(days) if days is not None else None,
                 hour=hour,
                 minute=minute,
                 options=dict(options),
-                due=self._initial_due_time(
-                    func,
-                    interval=interval,
-                    days=days,
-                    hour=hour,
-                    minute=minute,
+                due=due,
+                failures=persisted.failures if persisted is not None else 0,
+                last_failure=(
+                    persisted.last_failure if persisted is not None else None
                 ),
+                last_run=last_run,
             )
-            task.last_run = self._read_last_run(task.name)
-            self._tasks[func.__name__] = task
+            self._tasks[task_identity] = task
             return func
 
         return decorator
@@ -92,7 +133,10 @@ class Scheduler:
         return dict(self._tasks)
 
     def get_due_tasks(self, *, now: datetime | None = None) -> list[ScheduledTask]:
-        current = now or self._now_fn()
+        current = self._require_aware_datetime(
+            now or self._now_fn(),
+            label="Scheduler clock",
+        )
         return [task for task in self._tasks.values() if current >= task.due]
 
     def run_due_tasks(
@@ -102,14 +146,28 @@ class Scheduler:
         retries: int = 0,
         transient_exceptions: tuple[type[Exception], ...] = (),
     ) -> None:
-        current = now or self._now_fn()
+        current = self._require_aware_datetime(
+            now or self._now_fn(),
+            label="Scheduler clock",
+        )
+        first_error: Exception | None = None
         for task in self.get_due_tasks(now=current):
-            self._run_task_with_retry(
-                task,
-                retries=retries,
-                transient_exceptions=transient_exceptions,
-                now=current,
-            )
+            try:
+                self._run_task_with_retry(
+                    task,
+                    retries=retries,
+                    transient_exceptions=transient_exceptions,
+                    now=current,
+                )
+            except Exception as exc:
+                self.logger.exception(
+                    "Scheduled task %s failed",
+                    self._task_identity(task),
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def start(
         self,
@@ -146,21 +204,12 @@ class Scheduler:
         while True:
             try:
                 task.func()
-                task.failures = 0
-                task.last_failure = None
-                task.last_run = now
-                self.state_store.set(self._state_key(task.name), now.isoformat())
-                task.due = self._next_due_time(
-                    task,
-                    now=now,
-                )
-                return
             except transient_exceptions as exc:
                 if attempt < retries:
                     attempt += 1
                     self.logger.warning(
                         "Transient error during task %s: %s. Retrying %s/%s",
-                        task.name,
+                        self._task_identity(task),
                         exc,
                         attempt,
                         retries,
@@ -171,6 +220,34 @@ class Scheduler:
             except Exception as exc:
                 self._handle_task_failure(task, exc, now=now)
                 raise
+            else:
+                try:
+                    self._handle_task_success(task, now=now)
+                except Exception as exc:
+                    self._handle_task_failure(task, exc, now=now)
+                    raise
+                return
+
+    def _handle_task_success(
+        self,
+        task: ScheduledTask,
+        *,
+        now: datetime,
+    ) -> None:
+        next_due = self._next_due_time(task, now=now, last_run=now)
+        self._write_state(
+            self._task_identity(task),
+            _PersistedScheduleState(
+                last_run=now,
+                due=next_due,
+                failures=0,
+                last_failure=None,
+            ),
+        )
+        task.failures = 0
+        task.last_failure = None
+        task.last_run = now
+        task.due = next_due
 
     def _handle_task_failure(
         self,
@@ -183,9 +260,25 @@ class Scheduler:
         task.last_failure = now
         backoff_delay = 60 * (2 ** min(task.failures, 10))
         task.due = now + timedelta(seconds=backoff_delay)
+        identity = self._task_identity(task)
+        try:
+            self._write_state(
+                identity,
+                _PersistedScheduleState(
+                    last_run=task.last_run,
+                    due=task.due,
+                    failures=task.failures,
+                    last_failure=task.last_failure,
+                ),
+            )
+        except Exception:
+            self.logger.exception(
+                "Unable to persist failure state for %s",
+                identity,
+            )
         self.logger.error(
             "Task %s failed (attempt %s). Retrying in %ss at %s. Error: %s",
-            task.name,
+            identity,
             task.failures,
             backoff_delay,
             task.due,
@@ -194,17 +287,17 @@ class Scheduler:
 
     def _initial_due_time(
         self,
-        func: Callable[[], object],
         *,
+        current: datetime,
         interval: int | None,
         days: Sequence[int] | None,
         hour: int | None,
         minute: int | None,
+        last_run: datetime | None,
     ) -> datetime:
-        current = self._now_fn()
         if interval is not None:
-            return current + timedelta(seconds=interval)
-        last_run = self._read_last_run(func.__name__)
+            base = last_run if last_run is not None else current
+            return base + timedelta(seconds=interval)
         return self._cron_due_time(
             current,
             last_run=last_run,
@@ -213,12 +306,18 @@ class Scheduler:
             minute=minute,
         )
 
-    def _next_due_time(self, task: ScheduledTask, *, now: datetime) -> datetime:
+    def _next_due_time(
+        self,
+        task: ScheduledTask,
+        *,
+        now: datetime,
+        last_run: datetime,
+    ) -> datetime:
         if task.interval is not None:
             return now + timedelta(seconds=task.interval)
         return self._cron_due_time(
             now,
-            last_run=task.last_run,
+            last_run=last_run,
             days=task.days,
             hour=task.hour,
             minute=task.minute,
@@ -257,15 +356,108 @@ class Scheduler:
             candidate += timedelta(days=1)
         return start_from
 
-    def _read_last_run(self, task_name: str) -> datetime | None:
-        raw = self.state_store.get(self._state_key(task_name))
+    def _read_state(self, identity: str) -> _PersistedScheduleState | None:
+        try:
+            raw = self.state_store.get(self._state_key(identity))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to read scheduler state for {identity}"
+            ) from exc
         if raw is None:
             return None
-        return datetime.fromisoformat(raw)
+
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("scheduler state must be a JSON object")
+            version = data.get("version")
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version != _SCHEDULE_STATE_VERSION
+            ):
+                raise ValueError("unsupported state version")
+            failures = data["failures"]
+            if isinstance(failures, bool) or not isinstance(failures, int):
+                raise ValueError("failures must be an integer")
+            if failures < 0:
+                raise ValueError("failures must not be negative")
+            state = _PersistedScheduleState(
+                last_run=self._parse_datetime(data["last_run"]),
+                due=self._parse_datetime(data["due"]),
+                failures=failures,
+                last_failure=self._parse_datetime(data["last_failure"]),
+            )
+            if state.failures == 0 and state.last_failure is not None:
+                raise ValueError("successful state cannot have last_failure")
+            if state.failures > 0 and (state.last_failure is None or state.due is None):
+                raise ValueError("failed state requires last_failure and due")
+            return state
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid scheduler state for {identity}") from exc
+
+    def _write_state(
+        self,
+        identity: str,
+        state: _PersistedScheduleState,
+    ) -> None:
+        value = json.dumps(
+            {
+                "due": self._format_datetime(state.due),
+                "failures": state.failures,
+                "last_failure": self._format_datetime(state.last_failure),
+                "last_run": self._format_datetime(state.last_run),
+                "version": _SCHEDULE_STATE_VERSION,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.state_store.set(self._state_key(identity), value)
 
     @staticmethod
-    def _state_key(task_name: str) -> str:
-        return f"pybus.scheduler.last_run:{task_name}"
+    def _parse_datetime(value: object) -> datetime | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("timestamp must be a string or null")
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("timestamp must include a UTC offset")
+        return parsed
+
+    @staticmethod
+    def _format_datetime(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        Scheduler._require_aware_datetime(value, label="Scheduler state timestamp")
+        return value.isoformat()
+
+    @staticmethod
+    def _require_aware_datetime(value: datetime, *, label: str) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{label} must include a UTC offset")
+        return value
+
+    @staticmethod
+    def _resolve_identity(
+        func: Callable[[], object],
+        explicit_identity: str | None,
+    ) -> str:
+        if explicit_identity is not None:
+            if not explicit_identity.strip():
+                raise ValueError("Scheduled task identity must not be empty")
+            return explicit_identity
+        return f"{func.__module__}:{func.__qualname__}"
+
+    @staticmethod
+    def _task_identity(task: ScheduledTask) -> str:
+        if task.identity is None:
+            raise ValueError("ScheduledTask identity is required")
+        return task.identity
+
+    @staticmethod
+    def _state_key(identity: str) -> str:
+        return f"pybus.scheduler.state:{identity}"
 
     @staticmethod
     def _default_now() -> datetime:
@@ -302,6 +494,7 @@ def scheduled(
     days: Sequence[int] | None = None,
     hour: int | None = None,
     minute: int | None = None,
+    identity: str | None = None,
     **options: Any,
 ) -> Callable[[Callable[[], object]], Callable[[], object]]:
     return get_scheduler().scheduled(
@@ -309,6 +502,7 @@ def scheduled(
         days=days,
         hour=hour,
         minute=minute,
+        identity=identity,
         **options,
     )
 

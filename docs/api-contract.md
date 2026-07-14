@@ -1,7 +1,7 @@
 # pybus API Contract
 
 Status: STABLE CONTRACT DRAFT
-Date: 2026-07-07
+Date: 2026-07-13
 
 This document defines the minimum public contract that implementation must
 honor for `pybus` to be usable in isolation.
@@ -34,7 +34,7 @@ from pybus.contracts import Transport, OutboxStore, InboxStore
 Optional integrations:
 
 ```python
-from pybus.integrations.redis import RedisTransport
+from pybus.integrations.redis import RedisScheduleStateStore, RedisTransport
 from pybus.integrations.django import DjangoBusAdapter, DjangoConnectionCleanupHook
 ```
 
@@ -46,6 +46,44 @@ durability/sync track. `OutboxStore` and `InboxStore` are part of the public
 core contract as optional hooks, but durable outbox/inbox implementations,
 Redis transport, and Django integration remain follow-up layers even though
 their contracts are described in this repository.
+
+### 1.1 Scheduler contract
+
+`Scheduler`, `scheduled`, `configure_scheduler`, `get_scheduler`,
+`ScheduleStateStore`, and `InMemoryScheduleStateStore` are dependency-light core
+imports. `configure_scheduler(state_store=...)` accepts any store implementing
+string `get(key)` and `set(key, value)` operations. In-memory state remains the
+default; `RedisScheduleStateStore` is available only from the optional Redis
+integration.
+
+Every scheduled task has a stable identity. The default is
+`{func.__module__}:{func.__qualname__}`; callers may pass `identity=` when code
+moves or when a deployment needs an application-owned identifier. Empty or
+duplicate identities fail registration. `ScheduledTask.name` remains the short
+callable name for display, while `ScheduledTask.identity`, `Scheduler.tasks()`
+keys, logs, and durable keys use the stable identity.
+
+State is stored at `pybus.scheduler.state:{identity}` as one versioned JSON
+record containing `last_run`, `due`, `failures`, and `last_failure`. Timestamps
+and scheduler clock inputs must be ISO 8601 values with a UTC offset. Unknown
+versions, malformed values, and store read failures fail registration closed
+rather than treating completed work as new. An active failure restores its
+persisted backoff. After a successful run, the current decorator configuration
+is authoritative and computes the next due time from the persisted `last_run`,
+so changing an interval or cron rule does not execute once on the old schedule.
+
+Each due task is isolated for a complete run cycle. A failed callback or state
+checkpoint receives exponential backoff and does not prevent later due tasks
+from running. After the cycle, `run_due_tasks()` re-raises the first error so
+direct callers retain an observable failure contract. Transient callback errors
+may be retried in the same cycle; persistence errors never cause the callback to
+be invoked twice in that cycle.
+
+Scheduler execution is at-least-once. Completion is checkpointed only after the
+callable returns, so a failed checkpoint creates an indeterminate window in
+which application work may have succeeded and may run again after restart.
+Tasks should be idempotent. A durable state store does not provide leader
+election or exclude multiple scheduler processes.
 
 ---
 

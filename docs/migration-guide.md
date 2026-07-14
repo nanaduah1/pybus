@@ -1,7 +1,7 @@
 # pybus Migration Guide
 
 Status: WORKING DRAFT
-Date: 2026-07-07
+Date: 2026-07-13
 
 This guide describes how to move from the current `core.events` framework to
 `pybus` without breaking existing contracts.
@@ -130,6 +130,43 @@ Once the application has been fully migrated:
 - remove legacy worker assumptions if replaced
 
 This should only happen after a versioned deprecation period.
+
+### Scheduler state migration
+
+Before replacing the application scheduler, assign explicit identities to tasks
+whose Python module or qualified name may change during migration:
+
+```python
+@scheduled(hour=23, identity="reports.nightly")
+def build_reports():
+    ...
+```
+
+Inventory existing `{function_name}_last_run` or
+`pybus.scheduler.last_run:{function_name}` values and transform each required
+checkpoint into the versioned `pybus.scheduler.state:{identity}` record before
+starting the new scheduler. Include the offset-aware last-run timestamp and the
+next intended due time. Do not copy bare-name keys when more than one module
+defines that name; choose distinct explicit identities first.
+
+For a completed task, the version-1 value has this shape:
+
+```json
+{
+  "due": "2026-07-14T23:00:00+00:00",
+  "failures": 0,
+  "last_failure": null,
+  "last_run": "2026-07-13T23:00:00+00:00",
+  "version": 1
+}
+```
+
+Configure `RedisScheduleStateStore` in the process that owns scheduling. Keep
+the default in-memory store for tests that intentionally do not cross a process
+boundary. Run only one scheduler process for a given identity set: durable state
+preserves restarts and backoff but does not add leader election or exactly-once
+execution. Scheduled callables should remain idempotent because a completed
+call followed by a failed checkpoint can be replayed.
 
 ---
 

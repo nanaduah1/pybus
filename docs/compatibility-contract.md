@@ -1,7 +1,7 @@
 # pybus Compatibility Contract
 
 Status: STABLE COMPATIBILITY DRAFT
-Date: 2026-07-07
+Date: 2026-07-13
 
 This document describes the compatibility baseline we are preserving from the
 current `skuulbe-api` event framework.
@@ -104,6 +104,25 @@ Native pybus treats its dead-letter channel as terminal. During migration, only
 an explicit compatibility/redrive adapter may consume legacy failed-queue
 retries; the native listener must not be pointed at that queue as ordinary work.
 
+### 2.6 Scheduler semantics
+
+Scheduler registration no longer uses a bare function name as its operational
+identity. Defaults are module-qualified, explicit `identity=` values are
+supported, and duplicate identities fail instead of replacing an earlier task.
+The observable keys returned by `Scheduler.tasks()` therefore change from
+`func.__name__` to the qualified or explicit identity. `ScheduledTask.name`
+continues to expose the short function name.
+
+The durable key changes from the timestamp-only
+`pybus.scheduler.last_run:{name}` shape to a versioned JSON record at
+`pybus.scheduler.state:{identity}`. Deployments with existing state must migrate
+that checkpoint before enabling the new scheduler contract; the old key is not
+silently treated as durable proof for a potentially colliding identity.
+
+`run_due_tasks()` still reports failure to its caller, but only after attempting
+every task in the due snapshot. This deliberately changes the old first-error
+abort behavior so one failing task cannot starve later work.
+
 ---
 
 ## 3. Data Compatibility
@@ -134,6 +153,8 @@ transport track, not to the base envelope model.
 | Handler registry | Global module registry | Registry object with compatibility facade |
 | Worker loop | Process-local listener | `Worker` around `Listener`, with optional Django cleanup hook and Redis transport |
 | Batch buffering | Redis list per event type | Same behavior exposed through transport/store adapters |
+| Scheduler identity | Bare function name | Module-qualified or explicit stable identity |
+| Scheduler state | Process-local or bare-name timestamp | Versioned identity-keyed state with restart-safe backoff |
 | Request/response | Not present | New capability, no legacy breakage |
 
 ---

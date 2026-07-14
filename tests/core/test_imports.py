@@ -44,7 +44,18 @@ def test_core_imports_do_not_load_optional_django_or_redis() -> None:
         sys.meta_path.insert(0, BlockOptionalImports())
         sys.path.insert(0, {str(source_root)!r})
         import pybus
+        import pybus.scheduling
+        from pybus.integrations.redis import RedisScheduleStateStore
         import pybus.worker
+
+        class FakeRedis:
+            def get(self, key):
+                return None
+
+            def set(self, key, value):
+                return None
+
+        RedisScheduleStateStore(client=FakeRedis())
         assert pybus.Worker is pybus.worker.Worker
         """
     )

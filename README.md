@@ -77,6 +77,34 @@ finishes. Lifecycle hooks can wrap polling; Django applications can use
 each cycle. The worker deliberately does not install signal handlers or own the
 shared transport lifecycle.
 
+## Scheduled tasks
+
+The in-memory scheduler remains the zero-dependency default. Production
+processes can opt into durable restart state through the Redis extra:
+
+```python
+from pybus import configure_scheduler, scheduled
+from pybus.integrations.redis import RedisScheduleStateStore
+
+
+configure_scheduler(
+    state_store=RedisScheduleStateStore(url="redis://localhost:6379/0")
+)
+
+
+@scheduled(hour=23, minute=0, identity="reports.nightly")
+def build_nightly_reports() -> None:
+    ...
+```
+
+Without an explicit identity, pybus uses the callable's module-qualified name.
+Duplicate identities fail during registration. Scheduler state records the last
+successful run, next due time, and failure backoff, so a new scheduler instance
+does not repeat completed cron work or discard an active backoff. Task execution
+is at-least-once: if a task finishes but its completion cannot be written, it may
+run again after restart. The Redis store does not provide leader election; run
+only one active scheduler for a task set.
+
 ## Status
 
 This repository is the initial scaffold and design home for the framework.
