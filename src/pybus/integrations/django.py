@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Callable
 
 from pybus.bus import get_bus
+from pybus.composition import BusConfiguration as CoreBusConfiguration
 from pybus.envelope import MessageEnvelope
 from pybus.queues import DEFAULT_QUEUE_NAME
 from pybus.worker import Worker, WorkerHook
@@ -46,6 +48,20 @@ class DjangoConnectionCleanupHook(WorkerHook):
 
     def on_stop(self, worker: Worker) -> None:
         self._close_connections()
+
+
+@dataclass(frozen=True, slots=True)
+class BusConfiguration(CoreBusConfiguration):
+    """Django composition with connection cleanup enabled by default."""
+
+    def __post_init__(self) -> None:
+        if self.worker_hook_factories is None:
+            object.__setattr__(
+                self,
+                "worker_hook_factories",
+                (DjangoConnectionCleanupHook,),
+            )
+        CoreBusConfiguration.__post_init__(self)
 
 
 class DjangoBusAdapter:

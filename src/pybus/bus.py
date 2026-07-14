@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import time
 from dataclasses import dataclass
 from typing import cast
@@ -39,6 +39,7 @@ class Pybus:
     coordinator: RequestResponseCoordinator
     reply_queue: str
     payload_codec: PayloadCodec
+    worker_hook_factories: tuple[Callable[[], WorkerHook], ...]
 
     def __init__(
         self,
@@ -49,6 +50,7 @@ class Pybus:
         topology: QueueTopology | None = None,
         handler_targets: Sequence[object] | None = None,
         payload_codec: PayloadCodec | None = None,
+        worker_hook_factories: Sequence[Callable[[], WorkerHook]] = (),
     ) -> None:
         self.transport = transport
         if dispatcher is not None and payload_codec is not None:
@@ -67,6 +69,9 @@ class Pybus:
         )
         self.coordinator = RequestResponseCoordinator()
         self.reply_queue = default_reply_queue_name()
+        self.worker_hook_factories = tuple(worker_hook_factories)
+        if any(not callable(factory) for factory in self.worker_hook_factories):
+            raise TypeError("worker_hook_factories must contain callables")
         if handler_targets:
             from pybus.handlers import register_handlers
 
@@ -137,15 +142,22 @@ class Pybus:
         self,
         channel: str | Sequence[str] | None = None,
         *,
-        hooks: Sequence[WorkerHook] = (),
+        hooks: Sequence[WorkerHook] | None = None,
         error_delay: float = 1.0,
         logger=None,
         stop_event=None,
     ) -> Worker:
+        resolved_hooks = (
+            tuple(factory() for factory in self.worker_hook_factories)
+            if hooks is None
+            else tuple(hooks)
+        )
+        if any(not isinstance(hook, WorkerHook) for hook in resolved_hooks):
+            raise TypeError("worker hook factories must return WorkerHook instances")
         return Worker(
             self.listener,
             self.topology.default_queue if channel is None else channel,
-            hooks=hooks,
+            hooks=resolved_hooks,
             error_delay=error_delay,
             logger=logger,
             stop_event=stop_event,
@@ -274,6 +286,12 @@ class Pybus:
 _default_bus: Pybus | None = None
 
 
+def _set_default_bus(bus: Pybus) -> Pybus:
+    global _default_bus
+    _default_bus = bus
+    return bus
+
+
 def configure_transport(
     transport: object,
     *,
@@ -283,16 +301,16 @@ def configure_transport(
     handler_targets: Sequence[object] | None = None,
     payload_codec: PayloadCodec | None = None,
 ) -> Pybus:
-    global _default_bus
-    _default_bus = Pybus(
-        transport,
-        dispatcher=dispatcher,
-        serializer=serializer,
-        topology=topology,
-        handler_targets=handler_targets,
-        payload_codec=payload_codec,
+    return _set_default_bus(
+        Pybus(
+            transport,
+            dispatcher=dispatcher,
+            serializer=serializer,
+            topology=topology,
+            handler_targets=handler_targets,
+            payload_codec=payload_codec,
+        )
     )
-    return _default_bus
 
 
 def get_bus() -> Pybus:

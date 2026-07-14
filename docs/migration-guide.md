@@ -88,6 +88,29 @@ During migration:
 - handler adapters may live in the bridge while core message classes stay
   portable
 
+Replace application-owned dispatcher, registry, module-import, and caching
+helpers with one reusable configuration:
+
+```python
+from pybus.integrations.django import BusConfiguration
+
+APPLICATION_BUS = BusConfiguration(
+    transport_factory=lambda: RedisTransport(url=settings.REDIS_URL),
+    topology=APPLICATION_TOPOLOGY,
+    handler_modules=("application.handlers",),
+)
+
+APPLICATION_BUS.configure()
+test_bus = APPLICATION_BUS.create(transport=MemoryTransport())
+```
+
+Call `configure()` during process startup before module-level publishers run.
+Use `create()` for isolated tests and independently composed workers. Do not
+construct a second application registry, cache the bus again, or scan packages
+for handlers implicitly. The Django import installs fresh connection-cleanup
+hooks for workers automatically; use the core `BusConfiguration` when no Django
+integration is wanted, or pass `worker_hook_factories=()` to opt out explicitly.
+
 ---
 
 ## 5. Phase 3: Introduce JSON envelopes

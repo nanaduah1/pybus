@@ -156,7 +156,8 @@ types.
 
 ### 2.5 Payload codecs
 
-Applications configure one payload codec on `Pybus` / `configure_transport`.
+Applications configure one payload codec on `Pybus`, `configure_transport`, or
+`BusConfiguration`.
 The same codec applies to event, command, request, and response payloads and
 headers, including listener and retry paths.
 
@@ -205,6 +206,37 @@ explicit allowlist: each identifier requires an application-supplied resolver,
 which receives the decoded envelope headers and is responsible for tenant-aware
 lookup. The codec never uses an unscoped default model manager, and a resolver
 returning `None` fails deserialization.
+
+### 2.6 Application composition
+
+`BusConfiguration` is the declarative high-level composition contract. It owns
+a transport factory, topology, ordered handler module paths, concrete handler
+targets, payload codec, serializer, and worker hook factories.
+
+- construction has no transport or handler-import side effects
+- `create(transport=...)` builds a fresh isolated bus and never changes the
+  process default
+- `configure()` creates at most one bus per configuration object and installs
+  that bus as the process default
+- concurrent calls to one configuration return the same bus
+- a failed build is not cached and leaves the previous process default intact
+- handler modules are explicit, validated, imported in order, and registered
+  before concrete targets
+- duplicate concrete handler registrations are rejected, including overlap
+  between a handler module and an explicit target
+- each isolated bus owns a fresh dispatcher and registry
+- worker hook factories run only when a worker is created and return fresh hooks
+- explicit worker `hooks=` replace configured defaults
+
+`configure()` invokes the transport factory. The factory may construct a lazy
+client object but must not probe or connect to external infrastructure. Its
+result must provide callable `publish` and `consume` methods. Importing
+`BusConfiguration` from `pybus.integrations.django` has the same constructor and
+adds a fresh `DjangoConnectionCleanupHook` to each worker by default; explicit
+`worker_hook_factories=()` disables it. Configure independently in each worker
+process rather than assuming arbitrary transport clients are fork-safe.
+`Pybus` and `configure_transport` remain the low-level compatibility surface for
+custom dispatchers and direct composition.
 
 ---
 

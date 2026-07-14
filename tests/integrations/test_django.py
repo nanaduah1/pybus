@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from inspect import signature
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
+import pybus.bus as bus_module
 
 from pybus import (
+    BusConfiguration as CoreBusConfiguration,
     Pybus,
     command,
     event,
@@ -16,6 +18,7 @@ from pybus import (
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import InvalidMessageDefinitionError
 from pybus.integrations.django import (
+    BusConfiguration,
     DjangoBusAdapter,
     DjangoConnectionCleanupHook,
     publish_event,
@@ -118,6 +121,58 @@ def test_django_module_override_uses_the_same_publish_event_input(monkeypatch) -
 
     assert envelope.message_type == "student.enrolled"
     assert transport.size(bus.topology.default_queue) == 1
+
+
+def test_django_override_uses_bus_configuration_process_default(monkeypatch) -> None:
+    monkeypatch.setattr(bus_module, "_default_bus", bus_module._default_bus)
+    transaction = FakeTransactionModule(in_atomic_block=False)
+    monkeypatch.setattr(
+        "pybus.integrations.django._load_transaction_module", lambda: transaction
+    )
+    configuration = BusConfiguration(transport_factory=MemoryTransport)
+
+    bus = configuration.configure()
+    envelope = publish_event(StudentEnrolled(student_id="S-configuration"))
+
+    assert envelope.message_type == "student.enrolled"
+    assert bus.transport.size(bus.topology.default_queue) == 1
+
+
+def test_django_bus_configuration_has_the_core_constructor_contract() -> None:
+    assert (
+        signature(BusConfiguration).parameters
+        == signature(CoreBusConfiguration).parameters
+    )
+
+
+def test_django_bus_configuration_adds_fresh_cleanup_hooks_by_default(
+    monkeypatch,
+) -> None:
+    close_connections = Mock()
+    monkeypatch.setattr(
+        DjangoConnectionCleanupHook,
+        "_load_close_connections",
+        lambda self: close_connections,
+    )
+    bus = BusConfiguration(transport_factory=MemoryTransport).create()
+
+    first = bus.create_worker()
+    second = bus.create_worker()
+
+    assert len(first.hooks) == 1
+    assert isinstance(first.hooks[0], DjangoConnectionCleanupHook)
+    assert len(second.hooks) == 1
+    assert isinstance(second.hooks[0], DjangoConnectionCleanupHook)
+    assert first.hooks[0] is not second.hooks[0]
+
+
+def test_django_bus_configuration_allows_disabling_default_cleanup() -> None:
+    bus = BusConfiguration(
+        transport_factory=MemoryTransport,
+        worker_hook_factories=(),
+    ).create()
+
+    assert bus.create_worker().hooks == ()
 
 
 @pytest.mark.parametrize(

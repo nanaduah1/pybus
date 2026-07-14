@@ -15,6 +15,7 @@ def test_pybus_imports():
     assert pybus.PayloadCodec is not None
     assert pybus.PayloadTypeRegistry is not None
     assert pybus.PythonPayloadCodec is not None
+    assert pybus.BusConfiguration is not None
     assert pybus.configure_transport is not None
     assert pybus.publish_event is not None
     assert pybus.send_command is not None

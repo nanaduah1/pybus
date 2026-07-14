@@ -50,6 +50,11 @@ class Registry:
             self._message_classes[key] = message_class
         handlers = self._handlers.setdefault(key, [])
 
+        if any(existing is handler for existing in handlers):
+            raise ValueError(
+                f"Duplicate handler registered for {message_kind}:{message_type}"
+            )
+
         if handlers and (
             self._is_batched(handler)
             or any(self._is_batched(existing) for existing in handlers)

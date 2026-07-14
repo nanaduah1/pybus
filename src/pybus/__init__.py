@@ -1,4 +1,5 @@
 from pybus.contracts import InboxStore, OutboxStore, Transport
+from pybus.composition import BusConfiguration
 from pybus.codecs import PayloadCodec, PayloadTypeRegistry, PythonPayloadCodec
 from pybus.bus import (
     Pybus,
@@ -55,6 +56,7 @@ from pybus.worker import Worker, WorkerHook
 
 __all__ = [
     "BaseMessage",
+    "BusConfiguration",
     "CommandMessage",
     "command",
     "DEFAULT_FAILED_QUEUE_NAME",
