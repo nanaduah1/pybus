@@ -1,12 +1,97 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar, dataclass_transform
 
 from pybus.codecs import PayloadCodec, resolve_payload_codec
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import InvalidMessageDefinitionError
+
+
+MessageType = TypeVar("MessageType", bound=type[Any])
+
+
+def validate_queue_name(queue: object) -> str:
+    if not isinstance(queue, str) or not queue.strip():
+        raise InvalidMessageDefinitionError("queue must be a non-empty string")
+    return queue
+
+
+def _validate_message_contract(
+    message_type: str, version: int, queue: str | None
+) -> None:
+    if not isinstance(message_type, str) or not message_type:
+        raise InvalidMessageDefinitionError("message_type must be a non-empty string")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise InvalidMessageDefinitionError("version must be a positive integer")
+    if queue is not None:
+        validate_queue_name(queue)
+
+
+def _typed_message(
+    message_kind: str,
+    message_type: str,
+    *,
+    version: int,
+    queue: str | None,
+) -> Callable[[MessageType], MessageType]:
+    _validate_message_contract(message_type, version, queue)
+
+    def decorate(message_class: MessageType) -> MessageType:
+        if is_dataclass(message_class):
+            raise InvalidMessageDefinitionError(
+                "@event/@command owns the dataclass transformation; "
+                "remove the explicit @dataclass decorator"
+            )
+        decorated = dataclass(frozen=True, slots=True)(message_class)
+        setattr(decorated, "message_kind", message_kind)
+        setattr(decorated, "message_type", message_type)
+        setattr(decorated, "version", version)
+        setattr(decorated, "__pybus_default_queue__", queue)
+        setattr(decorated, "__pybus_typed_message__", True)
+        return decorated
+
+    return decorate
+
+
+@dataclass_transform(frozen_default=True)
+def event(
+    message_type: str,
+    *,
+    version: int = 1,
+    queue: str | None = None,
+) -> Callable[[MessageType], MessageType]:
+    """Declare an immutable typed event with a stable wire identifier."""
+    return _typed_message("event", message_type, version=version, queue=queue)
+
+
+@dataclass_transform(frozen_default=True)
+def command(
+    message_type: str,
+    *,
+    version: int = 1,
+    queue: str | None = None,
+) -> Callable[[MessageType], MessageType]:
+    """Declare an immutable typed command with a stable wire identifier."""
+    return _typed_message("command", message_type, version=version, queue=queue)
+
+
+def is_typed_message_class(value: object) -> bool:
+    return (
+        isinstance(value, type)
+        and is_dataclass(value)
+        and value.__dict__.get("__pybus_typed_message__") is True
+    )
+
+
+def typed_message_payload(message: object) -> dict[str, Any]:
+    if not is_typed_message_class(type(message)):
+        raise InvalidMessageDefinitionError(
+            f"{type(message).__name__} is not a declared pybus message"
+        )
+    return {field.name: getattr(message, field.name) for field in fields(message)}
 
 
 @dataclass

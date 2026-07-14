@@ -3,8 +3,19 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any, Callable
 
+from pybus.bus import get_bus
+from pybus.envelope import MessageEnvelope
 from pybus.queues import DEFAULT_QUEUE_NAME
 from pybus.worker import Worker, WorkerHook
+
+
+def _load_transaction_module() -> Any:
+    try:
+        return import_module("django.db.transaction")
+    except ModuleNotFoundError as exc:  # pragma: no cover - import safety
+        raise RuntimeError(
+            "Django is required for transaction-aware publishing"
+        ) from exc
 
 
 class DjangoConnectionCleanupHook(WorkerHook):
@@ -48,17 +59,8 @@ class DjangoBusAdapter:
         default_queue: str = DEFAULT_QUEUE_NAME,
     ) -> None:
         self._publish_fn = publish_fn
-        self._transaction = transaction_module or self._load_transaction_module()
+        self._transaction = transaction_module or _load_transaction_module()
         self.default_queue = default_queue
-
-    @staticmethod
-    def _load_transaction_module() -> Any:
-        try:
-            return import_module("django.db.transaction")
-        except ModuleNotFoundError as exc:  # pragma: no cover - import safety
-            raise RuntimeError(
-                "Django is required to use DjangoBusAdapter without injection"
-            ) from exc
 
     def schedule(
         self,
@@ -90,3 +92,41 @@ class DjangoBusAdapter:
             queue=queue,
             publish_on_commit=publish_on_commit,
         )
+
+
+def _publish_message(
+    message: object,
+    *,
+    expected_kind: str,
+    queue: str | None,
+) -> MessageEnvelope | None:
+    bus = get_bus()
+    envelope = bus._prepare_message(message, expected_kind=expected_kind)
+    target_queue = bus._resolve_publication_queue(message, queue)
+
+    def callback() -> MessageEnvelope:
+        return bus._publish_envelope(envelope, queue=target_queue)
+
+    transaction = _load_transaction_module()
+    if transaction.get_connection().in_atomic_block:
+        transaction.on_commit(callback)
+        return None
+    return callback()
+
+
+def publish_event(
+    event: object,
+    *,
+    queue: str | None = None,
+) -> MessageEnvelope | None:
+    """Django transaction-aware override of :func:`pybus.publish_event`."""
+    return _publish_message(event, expected_kind="event", queue=queue)
+
+
+def send_command(
+    command: object,
+    *,
+    queue: str | None = None,
+) -> MessageEnvelope | None:
+    """Django transaction-aware override of :func:`pybus.send_command`."""
+    return _publish_message(command, expected_kind="command", queue=queue)

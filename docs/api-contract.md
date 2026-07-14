@@ -21,6 +21,7 @@ The import surface should be stable and small:
 
 ```python
 import pybus
+from pybus import command, event, publish_event, send_command
 from pybus.messages import EventMessage, CommandMessage, RequestMessage, ResponseMessage
 from pybus.envelope import MessageEnvelope
 from pybus.registry import Registry
@@ -35,7 +36,12 @@ Optional integrations:
 
 ```python
 from pybus.integrations.redis import RedisScheduleStateStore, RedisTransport
-from pybus.integrations.django import DjangoBusAdapter, DjangoConnectionCleanupHook
+from pybus.integrations.django import (
+    DjangoBusAdapter,
+    DjangoConnectionCleanupHook,
+    publish_event,
+    send_command,
+)
 ```
 
 These optional integrations must not be imported by the core package during
@@ -206,6 +212,15 @@ returning `None` fails deserialization.
 
 Events are facts that happened.
 
+Declare the stable event type once:
+
+```python
+@pybus.event("student.enrolled", queue="student.lifecycle")
+class StudentEnrolled:
+    student_id: int
+    school_id: int
+```
+
 Public contract:
 
 ```python
@@ -218,13 +233,22 @@ Rules:
 - should be idempotent
 - should not return business data
 - should not imply a single consumer
+- annotations define the static field contract; runtime business invariants
+  belong in the typed class's `__post_init__`
+- an optional decorator `queue` declares the normal publication route once
+- an explicit `publish_event(event, queue=...)` wins over the decorator queue;
+  without either, the bus default queue is used
+- every resolved queue must be declared in the bus topology; invalid or unknown
+  routes fail before transport publication
+- queue selection is transport routing metadata and is not serialized into the
+  domain payload or message envelope
 
 Event handler contract:
 
 ```python
 @pybus.event_handler(StudentEnrolled)
-def handle_student_enrolled(event: EventMessage) -> None:
-    ...
+def handle_student_enrolled(event: StudentEnrolled) -> None:
+    print(event.student_id)
 ```
 
 Default behavior:
@@ -240,6 +264,12 @@ a valid header count wins. Legacy mapping payload fields are used only when the
 header is absent or malformed and may mirror the canonical value when requeued.
 Retry timestamps must include a UTC offset; a naive or malformed header timestamp
 is ignored and the listener may fall back to a valid legacy payload timestamp.
+Typed message fields are never mutated with retry metadata; their payload is
+unchanged through retries and dead-lettering.
+
+Typed handlers receive the domain message rather than its envelope. During
+migration, handlers that require transport headers or correlation metadata may
+remain string-bound and receive the legacy generic message wrapper.
 
 Batched delivery currently supports one batched handler per message type. A
 batched handler may not share its message type with another batched or ordinary
@@ -251,6 +281,12 @@ must fail explicitly instead of silently losing fan-out deliveries.
 ## 4. Command Contract
 
 Commands are intents.
+
+```python
+@pybus.command("billing.generate_student_bill")
+class GenerateStudentBill:
+    student_id: int
+```
 
 Public contract:
 
@@ -269,7 +305,7 @@ Command handler contract:
 
 ```python
 @pybus.command_handler(GenerateStudentBill)
-def handle_generate_student_bill(command: CommandMessage) -> None:
+def handle_generate_student_bill(command: GenerateStudentBill) -> None:
     ...
 ```
 

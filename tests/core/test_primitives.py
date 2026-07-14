@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import subprocess
+import sys
 from uuid import UUID, uuid4
 
 import pybus
+import pytest
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
+from pybus.exceptions import InvalidMessageDefinitionError
 from pybus.messages import EventMessage
 from pybus.registry import Registry
 from pybus.serializer import JsonSerializer
@@ -21,14 +25,33 @@ def test_import_surface_exposes_core_primitives() -> None:
 
 
 def test_imports_do_not_pull_optional_integrations() -> None:
-    import sys
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import pybus; "
+                "import pybus.integrations.django; "
+                "import pybus.integrations.redis; "
+                "assert 'redis' not in sys.modules; "
+                "assert 'django' not in sys.modules"
+            ),
+        ],
+        check=True,
+    )
 
-    import pybus as _pybus  # noqa: F401
-    import pybus.integrations.django as _django  # noqa: F401
-    import pybus.integrations.redis as _redis  # noqa: F401
 
-    assert "redis" not in sys.modules
-    assert "django" not in sys.modules
+@pytest.mark.parametrize("version", [True, 1.0, 0, -1, "1", None])
+def test_envelope_rejects_non_positive_integer_versions(version: object) -> None:
+    envelope = MessageEnvelope.create(
+        message_type="student.enrolled",
+        message_kind="event",
+        version=version,
+        payload={"student_id": 1},
+    )
+
+    with pytest.raises(InvalidMessageDefinitionError, match="positive integer"):
+        envelope.validate()
 
 
 def test_message_envelope_round_trip_with_datetime_and_uuid() -> None:

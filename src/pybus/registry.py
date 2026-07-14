@@ -3,14 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from pybus.exceptions import HandlerNotFoundError
-from pybus.messages import BaseMessage
 
-Handler = Callable[[BaseMessage], object]
+Handler = Callable[[object], object]
 
 
 class Registry:
     def __init__(self) -> None:
         self._handlers: dict[tuple[str, str], list[Handler]] = {}
+        self._message_classes: dict[tuple[str, str], type[object]] = {}
 
     def register(
         self,
@@ -18,12 +18,36 @@ class Registry:
         message_type: str,
         handler: Handler,
         *,
+        message_class: type[object] | None = None,
         allow_multiple: bool | None = None,
     ) -> Handler:
         if allow_multiple is None:
             allow_multiple = message_kind == "event"
 
         key = (message_kind, message_type)
+        existing_class = self._message_classes.get(key)
+        existing_handlers = self._handlers.get(key, [])
+        if message_class is None and existing_class is not None:
+            raise ValueError(
+                f"Cannot mix typed and string-bound handlers for "
+                f"{message_kind}:{message_type}"
+            )
+        if message_class is not None and existing_handlers and existing_class is None:
+            raise ValueError(
+                f"Cannot mix typed and string-bound handlers for "
+                f"{message_kind}:{message_type}"
+            )
+        if (
+            message_class is not None
+            and existing_class is not None
+            and existing_class is not message_class
+        ):
+            raise ValueError(
+                f"Cannot register different typed message classes for "
+                f"{message_kind}:{message_type}"
+            )
+        if message_class is not None:
+            self._message_classes[key] = message_class
         handlers = self._handlers.setdefault(key, [])
 
         if handlers and (
@@ -68,6 +92,14 @@ class Registry:
 
     def clear(self) -> None:
         self._handlers.clear()
+        self._message_classes.clear()
+
+    def message_class_for(
+        self,
+        message_kind: str,
+        message_type: str,
+    ) -> type[object] | None:
+        return self._message_classes.get((message_kind, message_type))
 
     def has_handlers(self, message_kind: str, message_type: str) -> bool:
         return bool(self.handlers_for(message_kind, message_type))

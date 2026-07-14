@@ -341,15 +341,11 @@ result = pybus.request(GetBillSummary(...), timeout=5)
 ### 9.2 Defining messages
 
 ```python
-from dataclasses import dataclass
-from pybus.messages import EventMessage
+from pybus import event
 
 
-@dataclass(frozen=True)
-class StudentEnrolled(EventMessage):
-    message_type = "student.enrolled"
-    version = 1
-
+@event("student.enrolled")
+class StudentEnrolled:
     student_id: int
     school_id: int
     session_id: int

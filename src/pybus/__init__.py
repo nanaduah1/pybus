@@ -28,6 +28,8 @@ from pybus.messages import (
     EventMessage,
     RequestMessage,
     ResponseMessage,
+    command,
+    event,
 )
 from pybus.registry import Registry
 from pybus.queues import (
@@ -54,6 +56,7 @@ from pybus.worker import Worker, WorkerHook
 __all__ = [
     "BaseMessage",
     "CommandMessage",
+    "command",
     "DEFAULT_FAILED_QUEUE_NAME",
     "DEFAULT_QUEUE_NAME",
     "DEFAULT_QUEUE_TOPOLOGY",
@@ -62,6 +65,7 @@ __all__ = [
     "configure_transport",
     "Dispatcher",
     "EventMessage",
+    "event",
     "InboxStore",
     "IndeterminateDeliveryError",
     "JsonSerializer",

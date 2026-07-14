@@ -170,7 +170,8 @@ class Listener:
         if spec.delay <= 0:
             return False
 
-        last_attempt = resolve_last_attempt(envelope.payload, envelope.headers)
+        retry_payload = None if self._is_typed(envelope) else envelope.payload
+        last_attempt = resolve_last_attempt(retry_payload, envelope.headers)
         if last_attempt is None:
             return False
 
@@ -316,12 +317,22 @@ class Listener:
         return self.retry_policy.should_retry(self._retry_count(envelope))
 
     def _retry_count(self, envelope: MessageEnvelope) -> int:
-        return resolve_retry_count(envelope.payload, envelope.headers)
+        retry_payload = None if self._is_typed(envelope) else envelope.payload
+        return resolve_retry_count(retry_payload, envelope.headers)
+
+    def _is_typed(self, envelope: MessageEnvelope) -> bool:
+        return (
+            self.dispatcher.registry.message_class_for(
+                envelope.message_kind,
+                envelope.message_type,
+            )
+            is not None
+        )
 
     def _requeue(self, channel_name: str, envelope: MessageEnvelope) -> None:
         now = self._now_fn()
         retries = self._retry_count(envelope)
-        if isinstance(envelope.payload, dict):
+        if not self._is_typed(envelope) and isinstance(envelope.payload, dict):
             payload = next_retry_payload(
                 envelope.payload,
                 attempted_at=now,

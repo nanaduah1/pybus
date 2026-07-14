@@ -124,24 +124,40 @@ domain.
 The target public shape should read like this:
 
 ```python
-transport = pybus.configure_transport(...)
-pybus.declare_queue("billing")
-pybus.declare_queue("billing.failed")
+topology = pybus.QueueTopology().declare_queues("student.lifecycle", "billing")
+bus = pybus.configure_transport(..., topology=topology)
 
 
-@pybus.event_handler("student.enrolled")
-def handle_student_enrolled(event):
+@pybus.event("student.enrolled", queue="student.lifecycle")
+class StudentEnrolled:
+    student_id: int
+
+
+@pybus.command("billing.generate_student_bill", queue="billing")
+class GenerateStudentBill:
+    student_id: int
+
+
+@pybus.event_handler(StudentEnrolled)
+def handle_student_enrolled(event: StudentEnrolled):
+    print(event.student_id)
+
+
+@pybus.command_handler(GenerateStudentBill)
+def handle_generate_student_bill(command: GenerateStudentBill):
     ...
 
 
-@pybus.command_handler("billing.generate_student_bill")
-def handle_generate_student_bill(command):
-    ...
-
-
-pybus.publish_event(StudentEnrolled(...))
-pybus.send_command(GenerateStudentBill(...))
+pybus.publish_event(StudentEnrolled(student_id=7))
+pybus.send_command(GenerateStudentBill(student_id=7))
 ```
+
+Core and Django publishing have identical function names and inputs. A Django
+application imports `publish_event` or `send_command` from
+`pybus.integrations.django`; transaction commit deferral is internal.
+For both imports, an explicit publication queue overrides the message
+decorator's queue, which overrides the configured bus default. The resolved
+queue must be declared in the configured topology.
 
 The exact helper names may evolve, but the division of responsibility should
 not:

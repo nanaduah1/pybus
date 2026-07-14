@@ -19,10 +19,74 @@ extras, starting with:
 - `pybus[redis]`
 - `pybus[django]`
 
-## Typed payloads
+## Quick start
 
-Configure a payload codec once on the bus when messages contain Python
-dataclasses or other non-JSON values:
+Declare each stable wire name once. Pybus turns the annotated class into an
+immutable typed message, creates the transport envelope, and reconstructs the
+same type for its handler:
+
+```python
+from pybus import event, event_handler, publish_event
+
+
+@event("student.enrolled")
+class StudentEnrolled:
+    student_id: int
+    school_id: int
+
+
+@event_handler(StudentEnrolled)
+def handle_student_enrolled(message: StudentEnrolled) -> None:
+    print(message.student_id)
+
+
+publish_event(StudentEnrolled(student_id=7, school_id=3))
+```
+
+Commands use the same shape with `@command(...)`, `@command_handler(...)`, and
+`send_command(command)`. Applications never construct `MessageEnvelope` for the
+normal path.
+
+Messages that normally use a dedicated queue can declare it once:
+
+```python
+from pybus import QueueTopology, configure_transport
+
+
+@event("student.enrolled", queue="student.lifecycle")
+class StudentEnrolled:
+    student_id: int
+
+
+topology = QueueTopology().declare_queue("student.lifecycle")
+configure_transport(transport, topology=topology)
+```
+
+`publish_event(event, queue="student.priority")` overrides that declaration for
+one publication. Queue precedence is call-site override, decorator default,
+then the bus default. Routing metadata is not added to the message payload or
+wire envelope. Every resolved queue must be present in the configured topology,
+so a missing worker route fails before the transport write instead of silently
+stranding work.
+
+Annotations provide the static contract. Put runtime domain invariants in the
+message class's `__post_init__`; the same validation runs for local construction
+and worker reconstruction.
+
+Django code changes only the import:
+
+```python
+from pybus.integrations.django import publish_event
+```
+
+That function accepts the same event object. It publishes immediately outside
+an atomic block and defers through `transaction.on_commit` inside one.
+
+## Rich nested payload values
+
+Top-level typed events and commands need no payload registration. Configure a
+payload codec when their fields contain nested dataclasses or other non-JSON
+values:
 
 ```python
 from dataclasses import dataclass
