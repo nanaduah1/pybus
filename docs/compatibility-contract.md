@@ -77,13 +77,20 @@ The following compatibility rules must be preserved:
 - handler retry limits default to `10`
 - handler delay defaults to `0`
 - failed events should route to the failed queue
-- retry payloads should preserve `retries` and `last_attempt`
+- legacy mapping retry payloads should preserve `retries` and `last_attempt`
+- typed message payloads remain unchanged; retry state is written only to
+  canonical envelope headers
 - a retry limit of `N` allows `N` retries after the initial attempt
 - a valid envelope header is canonical when payload and header retry metadata
   differ; payload metadata is a legacy fallback only when the header is absent
   or malformed
 - exhausted messages are terminal in the failed queue and are not dispatched by
   ordinary listener polling
+
+Legacy `EventMessage(message_type, payload)` and string-bound handlers remain
+available during migration. New decorator-defined messages use the concise
+object API and may not share a route with a string-bound handler, preventing a
+handler from receiving an unexpected argument shape.
 
 ### 2.5 Batching semantics
 

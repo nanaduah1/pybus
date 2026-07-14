@@ -4,16 +4,17 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from pybus.messages import BaseMessage
+from pybus.messages import BaseMessage, is_typed_message_class
 from pybus.registry import Registry
 
-Handler = Callable[[BaseMessage], object]
+Handler = Callable[[object], object]
 
 
 @dataclass(frozen=True, slots=True)
 class HandlerSpec:
     message_kind: str
     message_type: str
+    message_class: type[object] | None = None
     allow_multiple: bool | None = None
     retry_limit: int | None = None
     delay: int = 0
@@ -27,7 +28,7 @@ class ContinueProcessing:
     queue: str | None = None
 
 
-MessageBinding = str | type[BaseMessage]
+MessageBinding = str | type[object]
 
 
 def _handler_spec(handler: object) -> HandlerSpec | None:
@@ -46,9 +47,20 @@ def _resolve_message_binding(
     message: MessageBinding,
     *,
     expected_kind: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, type[object] | None]:
     if isinstance(message, str):
-        return expected_kind, message
+        return expected_kind, message, None
+
+    if is_typed_message_class(message):
+        message_kind = getattr(message, "message_kind", None)
+        if message_kind != expected_kind:
+            raise ValueError(
+                f"Expected a {expected_kind} message type, got {message_kind!r}"
+            )
+        message_type = getattr(message, "message_type", None)
+        if not isinstance(message_type, str) or not message_type:
+            raise TypeError(f"{message.__name__} must define a non-empty message_type")
+        return message_kind, message_type, message
 
     if not inspect.isclass(message) or not issubclass(message, BaseMessage):
         raise TypeError("message binding must be a message type or message_type string")
@@ -65,7 +77,7 @@ def _resolve_message_binding(
             f"{message.__name__} must define a non-empty message_type class attribute"
         )
 
-    return message_kind, message_type
+    return message_kind, message_type, None
 
 
 def _decorate_handler(
@@ -88,13 +100,14 @@ def _decorate_handler(
         if batch_size == 0:
             raise ValueError("batch_size must be greater than zero")
 
-    resolved_kind, resolved_type = _resolve_message_binding(
+    resolved_kind, resolved_type, resolved_class = _resolve_message_binding(
         message,
         expected_kind=message_kind,
     )
     spec = HandlerSpec(
         message_kind=resolved_kind,
         message_type=resolved_type,
+        message_class=resolved_class,
         allow_multiple=allow_multiple,
         retry_limit=retry_limit,
         delay=delay,
@@ -110,6 +123,7 @@ def _decorate_handler(
                 spec.message_kind,
                 spec.message_type,
                 handler,
+                message_class=spec.message_class,
                 allow_multiple=spec.allow_multiple,
             )
         return handler
@@ -236,6 +250,7 @@ def _register_target_handlers(registry: Registry, target: object) -> list[Handle
                 direct_spec.message_kind,
                 direct_spec.message_type,
                 target,  # type: ignore[arg-type]
+                message_class=direct_spec.message_class,
                 allow_multiple=direct_spec.allow_multiple,
             )
         ]
@@ -250,6 +265,7 @@ def _register_target_handlers(registry: Registry, target: object) -> list[Handle
                 spec.message_kind,
                 spec.message_type,
                 candidate,
+                message_class=spec.message_class,
                 allow_multiple=spec.allow_multiple,
             )
         )

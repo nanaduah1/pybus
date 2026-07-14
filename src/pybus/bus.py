@@ -8,15 +8,16 @@ from typing import cast
 from pybus.codecs import PayloadCodec
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
-from pybus.exceptions import MessageTimeoutError
+from pybus.exceptions import InvalidMessageDefinitionError, MessageTimeoutError
 from pybus.listener import Listener
 from pybus.messages import (
     BaseMessage,
-    CommandMessage,
-    EventMessage,
     RequestMessage,
     ResponseMessage,
+    is_typed_message_class,
     message_class_for_kind,
+    typed_message_payload,
+    validate_queue_name,
 )
 from pybus.contracts import Transport
 from pybus.queues import QueueTopology
@@ -73,19 +74,19 @@ class Pybus:
 
     def publish_event(
         self,
-        event: EventMessage,
+        event: object,
         *,
         queue: str | None = None,
     ) -> MessageEnvelope:
-        return self._publish(event, queue=queue)
+        return self._publish(event, expected_kind="event", queue=queue)
 
     def send_command(
         self,
-        command: CommandMessage,
+        command: object,
         *,
         queue: str | None = None,
     ) -> MessageEnvelope:
-        return self._publish(command, queue=queue)
+        return self._publish(command, expected_kind="command", queue=queue)
 
     def request(
         self,
@@ -152,11 +153,74 @@ class Pybus:
 
     def _publish(
         self,
-        message: BaseMessage,
+        message: object,
+        *,
+        expected_kind: str,
+        queue: str | None = None,
+    ) -> MessageEnvelope:
+        envelope = self._prepare_message(message, expected_kind=expected_kind)
+        target_queue = self._resolve_publication_queue(message, queue)
+        return self._publish_envelope(envelope, queue=target_queue)
+
+    def _resolve_publication_queue(self, message: object, queue: str | None) -> str:
+        if queue is not None:
+            resolved_queue = queue
+        elif is_typed_message_class(type(message)):
+            declared_queue = getattr(type(message), "__pybus_default_queue__", None)
+            resolved_queue = (
+                self.topology.default_queue
+                if declared_queue is None
+                else declared_queue
+            )
+        else:
+            resolved_queue = self.topology.default_queue
+        resolved_queue = validate_queue_name(resolved_queue)
+        if not self.topology.has_queue(resolved_queue):
+            raise InvalidMessageDefinitionError(
+                f"queue {resolved_queue!r} is not declared in the bus topology"
+            )
+        return resolved_queue
+
+    def _prepare_message(
+        self,
+        message: object,
+        *,
+        expected_kind: str,
+    ) -> MessageEnvelope:
+        message_kind = getattr(message, "message_kind", None)
+        if message_kind != expected_kind:
+            raise InvalidMessageDefinitionError(
+                f"Expected an {expected_kind}, got {message_kind!r}"
+            )
+        if isinstance(message, BaseMessage):
+            return message.to_envelope(payload_codec=self.payload_codec)
+        if not is_typed_message_class(type(message)):
+            raise InvalidMessageDefinitionError(
+                f"{type(message).__name__} is not a declared pybus message"
+            )
+        registered_class = self.dispatcher.registry.message_class_for(
+            message.message_kind,
+            message.message_type,
+        )
+        if registered_class is not None and type(message) is not registered_class:
+            raise InvalidMessageDefinitionError(
+                f"Expected {registered_class.__name__} for "
+                f"{message.message_kind}:{message.message_type}"
+            )
+        payload = typed_message_payload(message)
+        return MessageEnvelope.create(
+            message_type=message.message_type,
+            message_kind=message.message_kind,
+            version=message.version,
+            payload=self.payload_codec.encode(payload),
+        )
+
+    def _publish_envelope(
+        self,
+        envelope: MessageEnvelope,
         *,
         queue: str | None = None,
     ) -> MessageEnvelope:
-        envelope = message.to_envelope(payload_codec=self.payload_codec)
         self.transport.publish(
             queue or self.topology.default_queue, self.serializer.dump(envelope)
         )
@@ -237,12 +301,12 @@ def get_bus() -> Pybus:
     return _default_bus
 
 
-def publish_event(event: EventMessage, *, queue: str | None = None) -> MessageEnvelope:
+def publish_event(event: object, *, queue: str | None = None) -> MessageEnvelope:
     return get_bus().publish_event(event, queue=queue)
 
 
 def send_command(
-    command: CommandMessage,
+    command: object,
     *,
     queue: str | None = None,
 ) -> MessageEnvelope:

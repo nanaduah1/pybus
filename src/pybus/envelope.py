@@ -66,8 +66,12 @@ class MessageEnvelope:
             raise InvalidMessageDefinitionError("message_type is required")
         if not self.message_kind:
             raise InvalidMessageDefinitionError("message_kind is required")
-        if self.version is None:
-            raise InvalidMessageDefinitionError("version is required")
+        if (
+            isinstance(self.version, bool)
+            or not isinstance(self.version, int)
+            or self.version < 1
+        ):
+            raise InvalidMessageDefinitionError("version must be a positive integer")
         if not isinstance(self.headers, dict):
             raise InvalidMessageDefinitionError("headers must be a dictionary")
         return self

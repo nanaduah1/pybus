@@ -72,6 +72,17 @@ the same event type names.
 During migration:
 
 - handler functions may accept new typed message objects
+- define new messages once with `@event("stable.type")` or
+  `@command("stable.type")`; use the optional `queue=` argument when a message
+  has a stable non-default route
+- publish with `publish_event(event)` or `send_command(command)`; Pybus creates
+  the envelope
+- preserve exceptional per-call routing with `queue=`; it overrides the
+  decorator queue, which overrides the bus default
+- declare every decorator or call-site queue in the configured topology before
+  cutover; unresolved routes fail before publication
+- Django publishers use the same names and object inputs from
+  `pybus.integrations.django`
 - compatibility facades may adapt old `Event` wrappers
 - dead-letter behavior must remain intact
 - handler adapters may live in the bridge while core message classes stay
