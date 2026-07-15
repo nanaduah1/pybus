@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -8,6 +9,7 @@ from pybus.messages import BaseMessage, is_typed_message_class
 from pybus.registry import Registry
 
 Handler = Callable[[object], object]
+MAX_CONTINUATION_DELAY_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +28,25 @@ class HandlerSpec:
 @dataclass(frozen=True, slots=True)
 class ContinueProcessing:
     queue: str | None = None
+    delay: float = 0
+
+    def __post_init__(self) -> None:
+        if self.queue is not None:
+            if not isinstance(self.queue, str):
+                raise TypeError("continuation queue must be a string or None")
+            if not self.queue.strip():
+                raise ValueError("continuation queue must be non-empty")
+        if isinstance(self.delay, bool) or not isinstance(self.delay, (int, float)):
+            raise TypeError("continuation delay must be a finite number")
+        if isinstance(self.delay, float) and not math.isfinite(self.delay):
+            raise ValueError("continuation delay must be finite")
+        if self.delay < 0:
+            raise ValueError("continuation delay must be non-negative")
+        if self.delay > MAX_CONTINUATION_DELAY_SECONDS:
+            raise ValueError(
+                "continuation delay cannot exceed "
+                f"{MAX_CONTINUATION_DELAY_SECONDS:g} seconds"
+            )
 
 
 MessageBinding = str | type[object]
@@ -278,6 +299,7 @@ __all__ = [
     "batched_event_handler",
     "command_handler",
     "ContinueProcessing",
+    "MAX_CONTINUATION_DELAY_SECONDS",
     "event_handler",
     "register_handlers",
     "request_handler",

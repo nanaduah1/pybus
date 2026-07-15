@@ -10,7 +10,7 @@ import pybus.integrations.redis as redis_integration
 from pybus.bus import Pybus
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
-from pybus.handlers import batched_event_handler
+from pybus.handlers import ContinueProcessing, batched_event_handler, event_handler
 from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
 from pybus.integrations.redis import (
     RedisScheduleStateStore,
@@ -20,7 +20,12 @@ from pybus.integrations.redis import (
     decode_trusted_legacy_redis_payload,
 )
 from pybus.serializer import JsonSerializer
-from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME, Listener
+from pybus.listener import (
+    DEFAULT_FAILED_QUEUE_NAME,
+    DEFAULT_QUEUE_NAME,
+    DEFAULT_SLOW_QUEUE_NAME,
+    Listener,
+)
 from pybus.messages import EventMessage
 from pybus.registry import Registry
 from pybus.scheduling import configure_scheduler
@@ -213,6 +218,31 @@ def test_redis_default_and_slow_workers_dispatch_distinct_queues() -> None:
     assert handled == [("default", {"id": 1}), ("slow", {"id": 2})]
     assert bus.transport.size(bus.topology.dead_letter_queue) == 1
     assert bus.transport.consume(bus.topology.dead_letter_queue) == dead_letter_sentinel
+
+
+def test_redis_continuation_waits_before_publishing_to_declared_queue() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    sleep_calls: list[float] = []
+
+    def sleep_fn(delay: float) -> None:
+        assert transport.size(DEFAULT_SLOW_QUEUE_NAME) == 0
+        sleep_calls.append(delay)
+
+    bus = Pybus(transport=transport)
+    bus.listener._sleep_fn = sleep_fn
+
+    @event_handler("workflow.continue")
+    def continue_work(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing(queue=DEFAULT_SLOW_QUEUE_NAME, delay=0.05)
+
+    bus.dispatcher.registry.register("event", "workflow.continue", continue_work)
+    bus.publish_event(EventMessage(message_type="workflow.continue", payload={"id": 1}))
+
+    bus.listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert sleep_calls == [0.05]
+    assert transport.size(DEFAULT_SLOW_QUEUE_NAME) == 1
 
 
 def test_redis_worker_aborts_on_indeterminate_destructive_pop() -> None:

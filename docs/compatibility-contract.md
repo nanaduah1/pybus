@@ -195,7 +195,9 @@ The new package should eventually expose shims that map:
 - `batched_event_handler` -> batched registration helper
 - `EventListener` -> `Worker` plus `Listener` composition; use the optional
   Django cleanup hook where database connections are involved
-- `ContinueProcess` -> flow control response object
+- `ContinueProcess(queue=...)` -> `ContinueProcessing(queue=...)`; native
+  handlers may additionally select a short bounded `delay` to pace repeated
+  passes without changing the message envelope or consuming retry budget
 
 The shims are migration scaffolding. They should make the downstream codebase
 feel familiar while the core repo stays focused on the new public contracts.

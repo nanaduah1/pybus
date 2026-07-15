@@ -15,6 +15,7 @@ from pybus.queues import (
     DEFAULT_FAILED_QUEUE_NAME as _DEFAULT_FAILED_QUEUE_NAME,
     DEFAULT_QUEUE_NAME as _DEFAULT_QUEUE_NAME,
     DEFAULT_SLOW_QUEUE_NAME as _DEFAULT_SLOW_QUEUE_NAME,
+    QueueTopology,
 )
 from pybus.request_response import DEFAULT_REPLY_QUEUE
 from pybus.retries import (
@@ -40,6 +41,8 @@ class Listener:
         retry_policy: RetryPolicy | None = None,
         dead_letter_channel: str = DEFAULT_FAILED_QUEUE_NAME,
         now_fn: Callable[[], datetime] | None = None,
+        topology: QueueTopology | None = None,
+        sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
         self.transport = transport
         self.dispatcher = dispatcher or Dispatcher()
@@ -47,6 +50,8 @@ class Listener:
         self.retry_policy = retry_policy or RetryPolicy()
         self.dead_letter_channel = dead_letter_channel
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self._topology = topology
+        self._sleep_fn = sleep_fn or time.sleep
         self._batch_started_at: dict[str, datetime] = {}
         self._batch_retry_after: dict[str, datetime] = {}
 
@@ -202,6 +207,22 @@ class Listener:
         continuation: ContinueProcessing,
     ) -> None:
         target_queue = continuation.queue or channel_name
+        if target_queue == self.dead_letter_channel:
+            raise ValueError("dead-letter channel is terminal")
+        if (
+            continuation.queue is not None
+            and target_queue != channel_name
+            and self._topology is not None
+            and not self._topology.has_queue(target_queue)
+        ):
+            raise ValueError(f"Unknown continuation queue: {target_queue}")
+        if continuation.delay > 0:
+            try:
+                self._sleep_fn(continuation.delay)
+            except Exception as exc:
+                raise IndeterminateDeliveryError(
+                    "continuation delay failed after message claim"
+                ) from exc
         self._settle_after_claim(
             "continuation",
             lambda: self.transport.publish(
