@@ -12,7 +12,10 @@ from pybus import (
     Pybus,
     command,
     event,
+    prepare_command as core_prepare_command,
+    prepare_event as core_prepare_event,
     publish_event as core_publish_event,
+    publish_prepared as core_publish_prepared,
     send_command as core_send_command,
 )
 from pybus.envelope import MessageEnvelope
@@ -21,10 +24,13 @@ from pybus.integrations.django import (
     BusConfiguration,
     DjangoBusAdapter,
     DjangoConnectionCleanupHook,
+    prepare_command,
+    prepare_event,
     publish_event,
+    publish_prepared,
     send_command,
 )
-from pybus.queues import QueueTopology
+from pybus.queues import DEFAULT_QUEUE_NAME, QueueTopology
 from pybus.transports.memory import MemoryTransport
 from pybus.worker import Worker
 
@@ -267,6 +273,68 @@ def test_django_override_parameters_match_core_publication_functions() -> None:
         signature(publish_event).parameters == signature(core_publish_event).parameters
     )
     assert signature(send_command).parameters == signature(core_send_command).parameters
+    assert (
+        signature(prepare_event).parameters == signature(core_prepare_event).parameters
+    )
+    assert (
+        signature(prepare_command).parameters
+        == signature(core_prepare_command).parameters
+    )
+    assert (
+        signature(publish_prepared).parameters
+        == signature(core_publish_prepared).parameters
+    )
+
+
+def test_django_prepares_and_defers_the_exact_envelope(monkeypatch) -> None:
+    transport = MemoryTransport()
+    bus = Pybus(transport, topology=MESSAGE_TOPOLOGY)
+    transaction = FakeTransactionModule(in_atomic_block=True)
+    monkeypatch.setattr("pybus.integrations.django.get_bus", lambda: bus)
+    monkeypatch.setattr(
+        "pybus.integrations.django._load_transaction_module", lambda: transaction
+    )
+
+    prepared = prepare_command(
+        GenerateBill(student_id="S-6"),
+        message_id="job-46",
+        headers={"tenant_id": 3},
+    )
+    result = publish_prepared(prepared, queue="billing.commands")
+
+    assert result is None
+    assert transport.size("billing.commands") == 0
+    prepared.headers["tenant_id"] = 4
+    transaction.callbacks[0]()
+    raw = transport.consume("billing.commands")
+    received = MessageEnvelope.from_dict(bus.serializer.loads(raw))
+    assert received.message_id == "job-46"
+    assert received.headers == {"tenant_id": 3}
+    assert received.payload == {"student_id": "S-6"}
+
+
+def test_django_direct_publication_snapshots_identity_and_headers(monkeypatch) -> None:
+    transport = MemoryTransport()
+    bus = Pybus(transport)
+    transaction = FakeTransactionModule(in_atomic_block=True)
+    headers = {"tenant_id": 3}
+    monkeypatch.setattr("pybus.integrations.django.get_bus", lambda: bus)
+    monkeypatch.setattr(
+        "pybus.integrations.django._load_transaction_module", lambda: transaction
+    )
+
+    publish_event(
+        StudentEnrolled(student_id="S-7"),
+        message_id="event-47",
+        headers=headers,
+    )
+    headers["tenant_id"] = 4
+    transaction.callbacks[0]()
+
+    raw = transport.consume(DEFAULT_QUEUE_NAME)
+    received = MessageEnvelope.from_dict(bus.serializer.loads(raw))
+    assert received.message_id == "event-47"
+    assert received.headers == {"tenant_id": 3}
 
 
 def test_django_module_exports_matching_command_name() -> None:

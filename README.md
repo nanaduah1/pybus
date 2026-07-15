@@ -82,6 +82,27 @@ from pybus.integrations.django import publish_event
 That function accepts the same event object. It publishes immediately outside
 an atomic block and defers through `transaction.on_commit` inside one.
 
+Applications that persist work before publishing can prepare the exact JSON
+envelope with an application-owned identity, then publish that same envelope:
+
+```python
+from pybus import prepare_command, publish_prepared
+
+prepared = prepare_command(
+    GenerateBill(student_id=7),
+    message_id="job-42",
+    headers={"tenant_id": 3},
+)
+job.envelope = prepared.to_dict()
+job.save()
+publish_prepared(prepared, queue="billing.commands")
+```
+
+`prepare_event` and `prepare_command` perform no transport I/O. The Django
+versions have the same inputs; `publish_prepared` defers the already-created
+envelope until commit, so rollback publishes nothing and retrying from stored
+JSON preserves its identity.
+
 ## Reusable application composition
 
 Declare transport, topology, handlers, and integration hooks once. The same
@@ -201,6 +222,17 @@ finishes. Lifecycle hooks can wrap polling; Django applications can use
 `DjangoConnectionCleanupHook` to close obsolete database connections around
 each cycle. The worker deliberately does not install signal handlers or own the
 shared transport lifecycle.
+
+Command owners may configure metadata-only delivery observers through
+`command_delivery_observers=` on `BusConfiguration`, `Pybus`, or
+`configure_transport`. A single-handler command reports `STARTED` before its
+handler and then one of `SUCCEEDED`, `CONTINUED`, `RETRY_SCHEDULED`, or
+`DEAD_LETTERED`. Final callbacks run only after the corresponding local
+settlement succeeds. They are best-effort reconciliation signals, not durable
+acknowledgements: a process crash can lose a callback. A failed `STARTED`
+callback restores the unchanged command and aborts before business work. Later
+callback failures are logged after settlement and abort the worker without
+replaying a completed handler or changing its outcome.
 
 Handlers that finish one bounded pass but need another may return a paced
 continuation:

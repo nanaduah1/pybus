@@ -5,13 +5,25 @@ from pybus.bus import (
     Pybus,
     configure_transport,
     get_bus,
+    prepare_command,
+    prepare_event,
     publish_event,
+    publish_prepared,
     request,
     send_command,
 )
+from pybus.delivery import (
+    CommandDeliveryObserver,
+    CommandDeliveryOutcome,
+    CommandDeliveryStatus,
+)
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
-from pybus.exceptions import IndeterminateDeliveryError
+from pybus.exceptions import (
+    DeliveryObservationError,
+    IndeterminateDeliveryError,
+    WorkerAbortError,
+)
 from pybus.handlers import (
     MAX_CONTINUATION_DELAY_SECONDS,
     ContinueProcessing,
@@ -59,6 +71,9 @@ __all__ = [
     "BaseMessage",
     "BusConfiguration",
     "CommandMessage",
+    "CommandDeliveryObserver",
+    "CommandDeliveryOutcome",
+    "CommandDeliveryStatus",
     "command",
     "DEFAULT_FAILED_QUEUE_NAME",
     "DEFAULT_QUEUE_NAME",
@@ -69,6 +84,7 @@ __all__ = [
     "Dispatcher",
     "EventMessage",
     "event",
+    "DeliveryObservationError",
     "InboxStore",
     "IndeterminateDeliveryError",
     "JsonSerializer",
@@ -89,6 +105,9 @@ __all__ = [
     "QueueTopology",
     "Registry",
     "publish_event",
+    "publish_prepared",
+    "prepare_command",
+    "prepare_event",
     "RequestMessage",
     "ResponseMessage",
     "request",
@@ -106,5 +125,6 @@ __all__ = [
     "send_command",
     "Transport",
     "Worker",
+    "WorkerAbortError",
     "WorkerHook",
 ]

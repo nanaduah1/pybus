@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import time
 from dataclasses import dataclass
 from typing import cast
+import unicodedata
 
 from pybus.codecs import PayloadCodec
+from pybus.delivery import CommandDeliveryObserver
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import InvalidMessageDefinitionError, MessageTimeoutError
@@ -29,6 +31,47 @@ from pybus.serializer import JsonSerializer
 from pybus.worker import Worker, WorkerHook
 
 
+MAX_MESSAGE_ID_LENGTH = 255
+FRAMEWORK_DELIVERY_HEADERS = frozenset(
+    {"dead_lettered_from", "last_attempt", "retries"}
+)
+
+
+def _validate_message_id(message_id: object | None) -> str | None:
+    if message_id is None:
+        return None
+    if not isinstance(message_id, str):
+        raise InvalidMessageDefinitionError("message_id must be a string or None")
+    if not message_id.strip():
+        raise InvalidMessageDefinitionError("message_id must be non-empty")
+    if len(message_id) > MAX_MESSAGE_ID_LENGTH:
+        raise InvalidMessageDefinitionError(
+            f"message_id cannot exceed {MAX_MESSAGE_ID_LENGTH} characters"
+        )
+    if any(unicodedata.category(character) == "Cc" for character in message_id):
+        raise InvalidMessageDefinitionError(
+            "message_id cannot contain control characters"
+        )
+    return message_id
+
+
+def _copy_headers(headers: Mapping[str, object] | None) -> dict[str, object]:
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise InvalidMessageDefinitionError("headers must be a mapping")
+    copied = dict(headers)
+    if any(not isinstance(key, str) for key in copied):
+        raise InvalidMessageDefinitionError("header keys must be strings")
+    reserved = FRAMEWORK_DELIVERY_HEADERS.intersection(copied)
+    if reserved:
+        names = ", ".join(sorted(reserved))
+        raise InvalidMessageDefinitionError(
+            f"headers contain framework-reserved keys: {names}"
+        )
+    return copied
+
+
 @dataclass(slots=True)
 class Pybus:
     transport: Transport
@@ -40,6 +83,7 @@ class Pybus:
     reply_queue: str
     payload_codec: PayloadCodec
     worker_hook_factories: tuple[Callable[[], WorkerHook], ...]
+    command_delivery_observers: tuple[CommandDeliveryObserver, ...]
 
     def __init__(
         self,
@@ -51,6 +95,7 @@ class Pybus:
         handler_targets: Sequence[object] | None = None,
         payload_codec: PayloadCodec | None = None,
         worker_hook_factories: Sequence[Callable[[], WorkerHook]] = (),
+        command_delivery_observers: Sequence[CommandDeliveryObserver] = (),
     ) -> None:
         self.transport = transport
         if dispatcher is not None and payload_codec is not None:
@@ -67,12 +112,16 @@ class Pybus:
             serializer=self.serializer,
             dead_letter_channel=self.topology.dead_letter_queue,
             topology=self.topology,
+            command_delivery_observers=command_delivery_observers,
         )
         self.coordinator = RequestResponseCoordinator()
         self.reply_queue = default_reply_queue_name()
         self.worker_hook_factories = tuple(worker_hook_factories)
+        self.command_delivery_observers = tuple(command_delivery_observers)
         if any(not callable(factory) for factory in self.worker_hook_factories):
             raise TypeError("worker_hook_factories must contain callables")
+        if any(not callable(observer) for observer in self.command_delivery_observers):
+            raise TypeError("command_delivery_observers must contain callables")
         if handler_targets:
             from pybus.handlers import register_handlers
 
@@ -83,16 +132,81 @@ class Pybus:
         event: object,
         *,
         queue: str | None = None,
+        message_id: str | None = None,
+        headers: Mapping[str, object] | None = None,
     ) -> MessageEnvelope:
-        return self._publish(event, expected_kind="event", queue=queue)
+        return self._publish(
+            event,
+            expected_kind="event",
+            queue=queue,
+            message_id=message_id,
+            headers=headers,
+        )
 
     def send_command(
         self,
         command: object,
         *,
         queue: str | None = None,
+        message_id: str | None = None,
+        headers: Mapping[str, object] | None = None,
     ) -> MessageEnvelope:
-        return self._publish(command, expected_kind="command", queue=queue)
+        return self._publish(
+            command,
+            expected_kind="command",
+            queue=queue,
+            message_id=message_id,
+            headers=headers,
+        )
+
+    def prepare_event(
+        self,
+        event: object,
+        *,
+        message_id: str | None = None,
+        headers: Mapping[str, object] | None = None,
+    ) -> MessageEnvelope:
+        return self._prepare_message(
+            event, expected_kind="event", message_id=message_id, headers=headers
+        )
+
+    def prepare_command(
+        self,
+        command: object,
+        *,
+        message_id: str | None = None,
+        headers: Mapping[str, object] | None = None,
+    ) -> MessageEnvelope:
+        return self._prepare_message(
+            command,
+            expected_kind="command",
+            message_id=message_id,
+            headers=headers,
+        )
+
+    def publish_prepared(
+        self,
+        envelope: MessageEnvelope,
+        *,
+        queue: str | None = None,
+    ) -> MessageEnvelope:
+        self._validate_prepared_envelope(envelope)
+        target_queue = self._resolve_prepared_queue(queue)
+        return self._publish_envelope(envelope, queue=target_queue)
+
+    def _validate_prepared_envelope(self, envelope: MessageEnvelope) -> None:
+        if not isinstance(envelope, MessageEnvelope):
+            raise TypeError("envelope must be a MessageEnvelope")
+        envelope.validate()
+        _validate_message_id(envelope.message_id)
+
+    def _resolve_prepared_queue(self, queue: str | None) -> str:
+        target_queue = validate_queue_name(queue or self.topology.default_queue)
+        if not self.topology.has_queue(target_queue):
+            raise InvalidMessageDefinitionError(
+                f"queue {target_queue!r} is not declared in the bus topology"
+            )
+        return target_queue
 
     def request(
         self,
@@ -170,8 +284,15 @@ class Pybus:
         *,
         expected_kind: str,
         queue: str | None = None,
+        message_id: str | None = None,
+        headers: Mapping[str, object] | None = None,
     ) -> MessageEnvelope:
-        envelope = self._prepare_message(message, expected_kind=expected_kind)
+        envelope = self._prepare_message(
+            message,
+            expected_kind=expected_kind,
+            message_id=message_id,
+            headers=headers,
+        )
         target_queue = self._resolve_publication_queue(message, queue)
         return self._publish_envelope(envelope, queue=target_queue)
 
@@ -199,14 +320,35 @@ class Pybus:
         message: object,
         *,
         expected_kind: str,
+        message_id: str | None = None,
+        headers: Mapping[str, object] | None = None,
     ) -> MessageEnvelope:
+        resolved_message_id = _validate_message_id(message_id)
+        supplied_headers = _copy_headers(headers)
         message_kind = getattr(message, "message_kind", None)
         if message_kind != expected_kind:
             raise InvalidMessageDefinitionError(
                 f"Expected an {expected_kind}, got {message_kind!r}"
             )
         if isinstance(message, BaseMessage):
-            return message.to_envelope(payload_codec=self.payload_codec)
+            message.validate()
+            merged_headers = {**message.headers, **supplied_headers}
+            return MessageEnvelope.create(
+                message_id=resolved_message_id,
+                message_type=message.message_type,
+                message_kind=message.message_kind,
+                version=message.version,
+                payload=self.payload_codec.encode(
+                    message.payload, context=merged_headers
+                ),
+                headers=self.payload_codec.encode(merged_headers),
+                correlation_id=message.correlation_id,
+                causation_id=message.causation_id,
+                reply_to=message.reply_to,
+                expires_at=message.expires_at,
+                content_type=message.content_type,
+                content_encoding=message.content_encoding,
+            )
         if not is_typed_message_class(type(message)):
             raise InvalidMessageDefinitionError(
                 f"{type(message).__name__} is not a declared pybus message"
@@ -225,7 +367,9 @@ class Pybus:
             message_type=message.message_type,
             message_kind=message.message_kind,
             version=message.version,
-            payload=self.payload_codec.encode(payload),
+            payload=self.payload_codec.encode(payload, context=supplied_headers),
+            headers=self.payload_codec.encode(supplied_headers),
+            message_id=resolved_message_id,
         )
 
     def _publish_envelope(
@@ -301,6 +445,7 @@ def configure_transport(
     topology: QueueTopology | None = None,
     handler_targets: Sequence[object] | None = None,
     payload_codec: PayloadCodec | None = None,
+    command_delivery_observers: Sequence[CommandDeliveryObserver] = (),
 ) -> Pybus:
     return _set_default_bus(
         Pybus(
@@ -310,6 +455,7 @@ def configure_transport(
             topology=topology,
             handler_targets=handler_targets,
             payload_codec=payload_codec,
+            command_delivery_observers=command_delivery_observers,
         )
     )
 
@@ -320,16 +466,54 @@ def get_bus() -> Pybus:
     return _default_bus
 
 
-def publish_event(event: object, *, queue: str | None = None) -> MessageEnvelope:
-    return get_bus().publish_event(event, queue=queue)
+def publish_event(
+    event: object,
+    *,
+    queue: str | None = None,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
+) -> MessageEnvelope:
+    return get_bus().publish_event(
+        event, queue=queue, message_id=message_id, headers=headers
+    )
 
 
 def send_command(
     command: object,
     *,
     queue: str | None = None,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
 ) -> MessageEnvelope:
-    return get_bus().send_command(command, queue=queue)
+    return get_bus().send_command(
+        command, queue=queue, message_id=message_id, headers=headers
+    )
+
+
+def prepare_event(
+    event: object,
+    *,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
+) -> MessageEnvelope:
+    return get_bus().prepare_event(event, message_id=message_id, headers=headers)
+
+
+def prepare_command(
+    command: object,
+    *,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
+) -> MessageEnvelope:
+    return get_bus().prepare_command(command, message_id=message_id, headers=headers)
+
+
+def publish_prepared(
+    envelope: MessageEnvelope,
+    *,
+    queue: str | None = None,
+) -> MessageEnvelope:
+    return get_bus().publish_prepared(envelope, queue=queue)
 
 
 def request(
