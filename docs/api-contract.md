@@ -299,6 +299,23 @@ is ignored and the listener may fall back to a valid legacy payload timestamp.
 Typed message fields are never mutated with retry metadata; their payload is
 unchanged through retries and dead-lettering.
 
+A handler may request another bounded pass by returning
+`ContinueProcessing(queue=None, delay=0)`. The queue remains the source queue
+unless overridden. Composed buses reject overrides that are undeclared or name
+the terminal dead-letter queue. A positive delay may be a finite integer or
+fractional number no greater than 60 seconds; Pybus waits once and then
+republishes the exact original envelope without changing identity, timestamps,
+payload, headers, retry state, or correlation metadata. Continuation does not
+consume retry budget.
+
+Continuation delay is synchronous pacing, not durable scheduling. The pause
+occupies the worker, is not cooperatively interruptible, delays every other
+queue assigned to that worker, and lengthens the destructive-claim window before
+republication. Use it only for short cooldowns on isolated workers. The default
+zero preserves immediate continuation for compatibility and does not itself
+prevent a hot loop; applications must select a positive delay where a pass may
+make no progress and must keep a separate termination or stall policy.
+
 Typed handlers receive the domain message rather than its envelope. During
 migration, handlers that require transport headers or correlation metadata may
 remain string-bound and receive the legacy generic message wrapper.

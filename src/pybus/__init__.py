@@ -13,6 +13,7 @@ from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import IndeterminateDeliveryError
 from pybus.handlers import (
+    MAX_CONTINUATION_DELAY_SECONDS,
     ContinueProcessing,
     HandlerSpec,
     batched_event_handler,
@@ -73,6 +74,7 @@ __all__ = [
     "JsonSerializer",
     "get_bus",
     "ContinueProcessing",
+    "MAX_CONTINUATION_DELAY_SECONDS",
     "HandlerSpec",
     "batched_event_handler",
     "bind_handlers",

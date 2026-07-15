@@ -6,6 +6,7 @@ import pybus
 from pybus.bus import configure_transport, get_bus
 from pybus.dispatcher import Dispatcher
 from pybus.handlers import (
+    MAX_CONTINUATION_DELAY_SECONDS,
     ContinueProcessing,
     batched_event_handler,
     bind_handlers,
@@ -28,6 +29,45 @@ def test_handler_helpers_are_exposed_from_package_root() -> None:
     assert pybus.register_handlers is register_handlers
     assert pybus.bind_handlers is bind_handlers
     assert pybus.ContinueProcessing is ContinueProcessing
+    assert pybus.MAX_CONTINUATION_DELAY_SECONDS == MAX_CONTINUATION_DELAY_SECONDS
+
+
+def test_continuation_defaults_preserve_immediate_same_queue_behavior() -> None:
+    continuation = ContinueProcessing()
+
+    assert continuation.queue is None
+    assert continuation.delay == 0
+
+
+@pytest.mark.parametrize("delay", [0, 1, 0.05, MAX_CONTINUATION_DELAY_SECONDS])
+def test_continuation_accepts_bounded_finite_delays(delay: float) -> None:
+    assert ContinueProcessing("pybus.jobs.slow", delay).delay == delay
+
+
+@pytest.mark.parametrize(
+    "delay",
+    [
+        -1,
+        True,
+        False,
+        "1",
+        None,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        MAX_CONTINUATION_DELAY_SECONDS + 0.01,
+        10**1000,
+    ],
+)
+def test_continuation_rejects_unsafe_delays(delay: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        ContinueProcessing(delay=delay)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("queue", ["", "   ", 7, False])
+def test_continuation_rejects_invalid_queue_overrides(queue: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        ContinueProcessing(queue=queue)  # type: ignore[arg-type]
 
 
 def test_event_handlers_register_and_fan_out_from_a_handler_object() -> None:

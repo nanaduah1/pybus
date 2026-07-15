@@ -214,6 +214,12 @@ call followed by a failed checkpoint can be replayed.
 6. outbox/inbox flows
 7. request/response flows
 
+Legacy continuation handlers can move from `ContinueProcess(queue=...)` to
+`ContinueProcessing(queue=..., delay=...)`. Use a positive, short delay when a
+pass can legitimately need more work so the native worker cannot tight-loop.
+This delay blocks the worker and is not durable scheduling; keep long waits in
+the scheduler and preserve an application-level progress or stall ceiling.
+
 Outbox/inbox flows should be treated as a durability upgrade path, not as a
 new core capability in v1.
 

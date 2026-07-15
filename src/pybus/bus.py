@@ -66,6 +66,7 @@ class Pybus:
             dispatcher=self.dispatcher,
             serializer=self.serializer,
             dead_letter_channel=self.topology.dead_letter_queue,
+            topology=self.topology,
         )
         self.coordinator = RequestResponseCoordinator()
         self.reply_queue = default_reply_queue_name()

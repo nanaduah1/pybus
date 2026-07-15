@@ -5,12 +5,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from pybus import Pybus, event
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import IndeterminateDeliveryError
 from pybus.handlers import ContinueProcessing, batched_event_handler, event_handler
-from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME, Listener
+from pybus.listener import (
+    DEFAULT_FAILED_QUEUE_NAME,
+    DEFAULT_QUEUE_NAME,
+    DEFAULT_SLOW_QUEUE_NAME,
+    Listener,
+)
 from pybus.messages import EventMessage
+from pybus.queues import QueueTopology
 from pybus.registry import Registry
 from pybus.retries import RetryPolicy
 from pybus.serializer import JsonSerializer
@@ -177,6 +184,187 @@ def test_listener_requeues_continuation_on_same_queue() -> None:
     assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
+def test_listener_waits_before_republishing_paced_continuation() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    sleep_calls: list[float] = []
+
+    def sleep_fn(delay: float) -> None:
+        assert transport.size(DEFAULT_SLOW_QUEUE_NAME) == 0
+        sleep_calls.append(delay)
+
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        topology=QueueTopology(),
+        sleep_fn=sleep_fn,
+    )
+
+    @event_handler("billing.chunked")
+    def handle_event(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing(queue=DEFAULT_SLOW_QUEUE_NAME, delay=0.05)
+
+    registry.register("event", "billing.chunked", handle_event)
+    original = EventMessage(
+        message_type="billing.chunked",
+        payload={"batch_id": "B-2"},
+        headers={"tenant_id": 42, "retries": 3},
+        correlation_id="corr-1",
+        causation_id="cause-1",
+        reply_to="reply.queue",
+        expires_at=datetime(2026, 7, 14, tzinfo=timezone.utc),
+        content_type="application/json",
+        content_encoding="utf-8",
+    ).to_envelope(message_id="msg-paced")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(original))
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert sleep_calls == [0.05]
+    assert transport.size(DEFAULT_QUEUE_NAME) == 0
+    requeued = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_SLOW_QUEUE_NAME))
+    )
+    assert requeued.to_dict() == original.to_dict()
+
+
+def test_zero_delay_continuation_does_not_sleep() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    sleep_calls: list[float] = []
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        sleep_fn=sleep_calls.append,
+    )
+
+    @event_handler("billing.chunked")
+    def handle_event(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing()
+
+    registry.register("event", "billing.chunked", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="billing.chunked", payload={"batch_id": "B-3"}
+            ).to_envelope()
+        ),
+    )
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert sleep_calls == []
+
+
+def test_worker_paces_every_repeated_continuation_without_consuming_retries() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    sleep_calls: list[float] = []
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        sleep_fn=sleep_calls.append,
+    )
+
+    @event_handler("billing.chunked")
+    def handle_event(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing(delay=0.05)
+
+    registry.register("event", "billing.chunked", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="billing.chunked",
+                payload={"batch_id": "B-pace"},
+                headers={"retries": 2},
+            ).to_envelope(message_id="msg-repeated")
+        ),
+    )
+
+    Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run(max_iterations=3)
+
+    assert sleep_calls == [0.05, 0.05, 0.05]
+    raw_requeued = transport.consume(DEFAULT_QUEUE_NAME)
+    requeued = MessageEnvelope.from_dict(serializer.loads(raw_requeued))
+    assert requeued.message_id == "msg-repeated"
+    assert requeued.headers["retries"] == 2
+
+
+def test_typed_event_continuation_preserves_typed_payload() -> None:
+    @event("workflow.typed_continuation")
+    class ContinueChunk:
+        chunk_id: int
+
+    transport = MemoryTransport()
+    bus = Pybus(transport=transport)
+
+    @event_handler(ContinueChunk)
+    def handle_event(message: ContinueChunk) -> ContinueProcessing:
+        return ContinueProcessing(delay=0.01)
+
+    bus.dispatcher.registry.register(
+        "event",
+        ContinueChunk.message_type,
+        handle_event,
+        message_class=ContinueChunk,
+        allow_multiple=True,
+    )
+    bus.listener._sleep_fn = lambda delay: None
+    bus.publish_event(ContinueChunk(chunk_id=7))
+
+    bus.listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    raw_requeued = transport.consume(DEFAULT_QUEUE_NAME)
+    envelope = MessageEnvelope.from_dict(bus.serializer.loads(raw_requeued))
+    decoded = bus.dispatcher.decode(envelope)
+    assert decoded == ContinueChunk(chunk_id=7)
+
+
+@pytest.mark.parametrize("queue", ["undeclared.queue", DEFAULT_FAILED_QUEUE_NAME])
+def test_composed_listener_rejects_unsafe_continuation_queue(queue: str) -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        topology=QueueTopology(),
+        retry_policy=RetryPolicy(max_retries=0),
+    )
+
+    @event_handler("billing.chunked")
+    def handle_event(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing(queue=queue)
+
+    registry.register("event", "billing.chunked", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="billing.chunked", payload={"batch_id": "B-4"}
+            ).to_envelope()
+        ),
+    )
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+    raw_failed = transport.consume(DEFAULT_FAILED_QUEUE_NAME)
+    failed = MessageEnvelope.from_dict(serializer.loads(raw_failed))
+    assert failed.headers["dead_lettered_from"] == DEFAULT_QUEUE_NAME
+    if queue != DEFAULT_FAILED_QUEUE_NAME:
+        assert transport.size(queue) == 0
+
+
 def test_worker_aborts_after_retry_publication_fails_post_claim() -> None:
     transport = SettlementFailureTransport()
     serializer = JsonSerializer()
@@ -249,15 +437,17 @@ def test_worker_aborts_after_continuation_publication_fails_post_claim() -> None
     transport = SettlementFailureTransport()
     serializer = JsonSerializer()
     registry = Registry()
+    sleep_calls: list[float] = []
     listener = Listener(
         transport=transport,
         dispatcher=Dispatcher(registry=registry, serializer=serializer),
         serializer=serializer,
+        sleep_fn=sleep_calls.append,
     )
 
     @event_handler("billing.chunked")
     def continue_event(message: EventMessage) -> ContinueProcessing:
-        return ContinueProcessing()
+        return ContinueProcessing(delay=0.05)
 
     registry.register("event", "billing.chunked", continue_event)
     for message_id in ("first", "second"):
@@ -273,6 +463,44 @@ def test_worker_aborts_after_continuation_publication_fails_post_claim() -> None
     transport.fail_channels.add(DEFAULT_QUEUE_NAME)
 
     with pytest.raises(IndeterminateDeliveryError, match="continuation"):
+        Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
+
+    assert sleep_calls == [0.05]
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+
+def test_worker_aborts_when_continuation_delay_fails_after_claim() -> None:
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+
+    def fail_delay(delay: float) -> None:
+        raise RuntimeError(f"clock failed at {delay}")
+
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        sleep_fn=fail_delay,
+    )
+
+    @event_handler("billing.chunked")
+    def continue_event(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing(delay=0.05)
+
+    registry.register("event", "billing.chunked", continue_event)
+    for message_id in ("first", "second"):
+        transport.publish(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="billing.chunked",
+                    payload={"id": message_id},
+                ).to_envelope(message_id=message_id)
+            ),
+        )
+
+    with pytest.raises(IndeterminateDeliveryError, match="continuation delay"):
         Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
 
     assert transport.size(DEFAULT_QUEUE_NAME) == 1

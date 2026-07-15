@@ -202,6 +202,28 @@ finishes. Lifecycle hooks can wrap polling; Django applications can use
 each cycle. The worker deliberately does not install signal handlers or own the
 shared transport lifecycle.
 
+Handlers that finish one bounded pass but need another may return a paced
+continuation:
+
+```python
+from pybus import ContinueProcessing
+
+
+def handle_chunk(message) -> ContinueProcessing:
+    process_next_chunk(message)
+    return ContinueProcessing(queue="pybus.jobs.slow", delay=0.05)
+```
+
+The optional delay is a short synchronous worker pause before Pybus republishes
+the unchanged envelope. It is capped at 60 seconds and is intended to prevent
+tight workflow loops on an isolated worker. It is not durable future scheduling:
+the worker cannot stop during the pause, other queues assigned to that worker
+also wait, and a process crash before republication can lose the destructively
+claimed message. Use the scheduler or transport-specific delayed delivery for
+long waits. The backward-compatible default delay is zero, so applications that
+can make no progress must opt into a positive value and retain their own loop
+termination or stall ceiling.
+
 ## Scheduled tasks
 
 The in-memory scheduler remains the zero-dependency default. Production
