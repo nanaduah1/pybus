@@ -21,7 +21,19 @@ The import surface should be stable and small:
 
 ```python
 import pybus
-from pybus import command, event, publish_event, send_command
+from pybus import (
+    CommandDeliveryOutcome,
+    CommandDeliveryStatus,
+    DeliveryObservationError,
+    WorkerAbortError,
+    command,
+    event,
+    prepare_command,
+    prepare_event,
+    publish_event,
+    publish_prepared,
+    send_command,
+)
 from pybus.messages import EventMessage, CommandMessage, RequestMessage, ResponseMessage
 from pybus.envelope import MessageEnvelope
 from pybus.registry import Registry
@@ -39,7 +51,10 @@ from pybus.integrations.redis import RedisScheduleStateStore, RedisTransport
 from pybus.integrations.django import (
     DjangoBusAdapter,
     DjangoConnectionCleanupHook,
+    prepare_command,
+    prepare_event,
     publish_event,
+    publish_prepared,
     send_command,
 )
 ```
@@ -211,7 +226,8 @@ returning `None` fails deserialization.
 
 `BusConfiguration` is the declarative high-level composition contract. It owns
 a transport factory, topology, ordered handler module paths, concrete handler
-targets, payload codec, serializer, and worker hook factories.
+targets, payload codec, serializer, worker hook factories, and ordered command
+delivery observers.
 
 - construction has no transport or handler-import side effects
 - `create(transport=...)` builds a fresh isolated bus and never changes the
@@ -237,6 +253,46 @@ adds a fresh `DjangoConnectionCleanupHook` to each worker by default; explicit
 process rather than assuming arbitrary transport clients are fork-safe.
 `Pybus` and `configure_transport` remain the low-level compatibility surface for
 custom dispatchers and direct composition.
+
+### 2.7 Prepared publication and stable identity
+
+Normal publication creates an envelope and publishes it in one call. Durable
+application schedulers may separate those operations:
+
+```python
+prepared = pybus.prepare_command(command, message_id="job-42", headers={...})
+stored_json = prepared.to_dict()
+pybus.publish_prepared(prepared, queue="billing.commands")
+```
+
+`prepare_event` and `prepare_command` perform no transport I/O. Their envelope
+can be restored with `MessageEnvelope.from_dict` and republished without
+changing `message_id`, `created_at`, payload, headers, or correlation metadata.
+`publish_event` and `send_command` accept the same optional `message_id` and
+`headers` for one-step publication. Supplied headers are copied; call-site
+values override headers on a legacy `BaseMessage` without mutating it.
+
+A caller-supplied message ID must be a nonblank string of at most 255 characters
+and contain no control characters. It is application-visible idempotency
+and reconciliation material, not a framework deduplication or exactly-once
+guarantee. Header keys must be strings and values must satisfy the configured
+payload codec. `publish_prepared` validates the envelope and declared target
+queue before transport I/O. Because a deserialized envelope no longer carries
+its message decorator, callers must pass `queue=` when replaying work whose
+route is not the bus default.
+
+Call-site headers may not initialize framework-owned `retries`, `last_attempt`,
+or `dead_lettered_from` state. Legacy envelopes may retain those keys, and
+`publish_prepared` accepts them so genuine retry state can survive durable
+reconstruction.
+
+Message IDs are operational metadata and must not contain secrets, personal
+data, or other sensitive business values.
+
+The Django module exposes the same function names and inputs. It creates the
+exact envelope before registering `transaction.on_commit`; rollback publishes
+nothing. A post-commit publication failure is still indeterminate and must be
+reconciled using the stable message ID.
 
 ---
 
@@ -360,6 +416,48 @@ def handle_generate_student_bill(command: GenerateStudentBill) -> None:
 
 The command layer may allow multiple subscribers only if explicitly configured.
 The default must be single-handler semantics.
+
+### 4.1 Command delivery outcomes
+
+Applications may configure ordered `command_delivery_observers` on
+`BusConfiguration`, `Pybus`, or `configure_transport`. Version one is limited to
+single-handler, non-batched commands. Ordinary typed handlers continue to
+receive only their domain command; delivery metadata is never added to the
+payload or handler signature.
+
+Each observer receives a frozen `CommandDeliveryOutcome` with `status`,
+`message_id`, `message_type`, `version`, `source_queue`, optional
+`destination_queue`, `retry_count`, and `max_retries`. Statuses are:
+
+- `STARTED`, emitted before the handler is called
+- `SUCCEEDED`, emitted after the handler returns normally
+- `CONTINUED`, emitted after the unchanged envelope is republished
+- `RETRY_SCHEDULED`, emitted after the retry envelope is published
+- `DEAD_LETTERED`, emitted after terminal publication succeeds
+
+A failed `STARTED` observer restores the exact claimed command to its source
+queue without changing retry state, then raises `DeliveryObservationError` to
+abort before the handler. Failure of that recovery publication is instead
+indeterminate. All observers are attempted in
+configuration order; observers must be idempotent because successful siblings
+can receive `STARTED` again after recovery and restart. Failures from
+post-settlement observers are logged after
+all observers run, then raise `DeliveryObservationError` to abort the worker:
+they never replay the handler, change the settled outcome, or consume another
+message. An indeterminate retry,
+continuation, or dead-letter publication emits no matching final outcome and
+aborts the worker through the same fail-closed path.
+
+If observers are configured for a command route with multiple handlers, Pybus
+restores the unchanged claimed command and raises `WorkerAbortError` before
+invoking any handler. Applications must correct the route to the normal
+single-handler command contract before restarting the worker.
+
+Outcomes are best-effort process callbacks. A crash between local settlement
+and observer invocation can lose one, so database correctness must include
+reconciliation by stable message ID rather than treating callbacks as a durable
+acknowledgement. Events, requests, responses, and batched delivery do not emit
+these outcomes in version one.
 
 ---
 
@@ -553,6 +651,12 @@ therefore indeterminate. If a retry, dead-letter, poison record, continuation,
 batch buffer, or response cannot be encoded or published after a message was
 claimed, the listener also raises `IndeterminateDeliveryError`. The worker
 reports that error to hooks and then aborts instead of consuming later messages.
+
+`WorkerAbortError` also stops the worker after hooks observe a known state that
+requires operator action. `DeliveryObservationError` is its delivery-observer
+subclass. These errors do not imply unknown transport settlement;
+`IndeterminateDeliveryError` remains reserved for destructive claim or
+settlement outcomes that cannot be known.
 
 The optional `DjangoConnectionCleanupHook` lazily imports Django and runs
 `close_old_connections()` before and after each poll and again at shutdown.

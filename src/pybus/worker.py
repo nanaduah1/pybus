@@ -7,7 +7,7 @@ import sys
 from threading import Event, Lock
 from typing import Protocol
 
-from pybus.exceptions import IndeterminateDeliveryError
+from pybus.exceptions import IndeterminateDeliveryError, WorkerAbortError
 
 
 class ListenerLike(Protocol):
@@ -108,7 +108,9 @@ class Worker:
                 if cycle_error is None:
                     continue
                 self._report_error(cycle_error)
-                if isinstance(cycle_error, IndeterminateDeliveryError):
+                if isinstance(
+                    cycle_error, (IndeterminateDeliveryError, WorkerAbortError)
+                ):
                     raise cycle_error
                 self._stop_event.wait(self.error_delay)
         finally:

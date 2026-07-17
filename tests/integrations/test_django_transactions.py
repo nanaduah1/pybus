@@ -24,7 +24,7 @@ from django.db import connection, transaction
 
 from pybus import configure_transport, event
 from pybus.envelope import MessageEnvelope
-from pybus.integrations.django import publish_event
+from pybus.integrations.django import prepare_event, publish_event, publish_prepared
 from pybus.queues import QueueTopology
 from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
@@ -76,6 +76,19 @@ def test_django_publish_event_suppresses_rolled_back_work() -> None:
     with pytest.raises(RuntimeError, match="rollback"):
         with transaction.atomic():
             publish_event(StudentEnrolled(student_id=2))
+            raise RuntimeError("rollback")
+
+    assert transport.size("student.lifecycle") == 0
+
+
+def test_django_publish_prepared_suppresses_rolled_back_work() -> None:
+    transport = MemoryTransport()
+    configure_transport(transport, topology=MESSAGE_TOPOLOGY)
+    prepared = prepare_event(StudentEnrolled(student_id=20), message_id="event-20")
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        with transaction.atomic():
+            publish_prepared(prepared, queue="student.lifecycle")
             raise RuntimeError("rollback")
 
     assert transport.size("student.lifecycle") == 0

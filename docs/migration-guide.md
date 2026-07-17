@@ -111,6 +111,31 @@ for handlers implicitly. The Django import installs fresh connection-cleanup
 hooks for workers automatically; use the core `BusConfiguration` when no Django
 integration is wanted, or pass `worker_hook_factories=()` to opt out explicitly.
 
+Database-backed job owners should prepare and persist the exact envelope before
+publication:
+
+```python
+prepared = prepare_command(command, message_id=str(job.id))
+job.envelope = prepared.to_dict()
+job.save()
+publish_prepared(prepared, queue=job.queue)
+```
+
+Import these names from `pybus.integrations.django` when publication must wait
+for commit. Configure a command-delivery observer to project `STARTED`,
+`SUCCEEDED`, `CONTINUED`, `RETRY_SCHEDULED`, and `DEAD_LETTERED` into application
+job state. Keep reconciliation keyed by the stable message ID: callbacks are
+best effort and can be missed if the process exits after settlement. Do not put
+job IDs or retry metadata into domain command fields merely to manage framework
+lifecycle.
+
+Observer storage failures stop the worker fail-closed with
+`DeliveryObservationError`. A `STARTED` failure restores the unchanged command
+before aborting; a later failure occurs only after the reported settlement and
+does not replay it. Failed recovery publication remains
+`IndeterminateDeliveryError`. Operations should repair the observer store or
+reconcile by stable ID before restarting the worker.
+
 ---
 
 ## 5. Phase 3: Introduce JSON envelopes

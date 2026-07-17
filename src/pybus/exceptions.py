@@ -33,5 +33,13 @@ class IndeterminateDeliveryError(TransportError):
     """Raised when a destructive claim or its later settlement is indeterminate."""
 
 
+class WorkerAbortError(PybusError):
+    """Raised when a known delivery state requires the worker to stop."""
+
+
+class DeliveryObservationError(WorkerAbortError):
+    """Raised when delivery observers fail before or after a known settlement."""
+
+
 class InvalidMessageDefinitionError(ValueError, PybusError):
     """Raised when a message or envelope definition is invalid."""

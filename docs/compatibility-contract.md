@@ -86,6 +86,8 @@ The following compatibility rules must be preserved:
   or malformed
 - exhausted messages are terminal in the failed queue and are not dispatched by
   ordinary listener polling
+- caller-supplied stable message IDs survive retry, continuation, dead-letter,
+  Django commit deferral, and prepared-envelope replay unchanged
 
 Legacy `EventMessage(message_type, payload)` and string-bound handlers remain
 available during migration. New decorator-defined messages use the concise
@@ -201,6 +203,11 @@ The new package should eventually expose shims that map:
 
 The shims are migration scaffolding. They should make the downstream codebase
 feel familiar while the core repo stays focused on the new public contracts.
+
+Prepared publication and command delivery observers are additive native APIs.
+They do not change legacy handlers or payloads. Observers are process-local,
+metadata-only reconciliation signals and do not strengthen the destructive-pop
+transport into exactly-once or crash-safe delivery.
 
 These shims are temporary and should be clearly marked deprecated when used.
 Native `Worker` input must never include the terminal failed queue; legacy

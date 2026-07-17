@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Callable
@@ -115,9 +116,16 @@ def _publish_message(
     *,
     expected_kind: str,
     queue: str | None,
+    message_id: str | None,
+    headers: Mapping[str, object] | None,
 ) -> MessageEnvelope | None:
     bus = get_bus()
-    envelope = bus._prepare_message(message, expected_kind=expected_kind)
+    envelope = bus._prepare_message(
+        message,
+        expected_kind=expected_kind,
+        message_id=message_id,
+        headers=headers,
+    )
     target_queue = bus._resolve_publication_queue(message, queue)
 
     def callback() -> MessageEnvelope:
@@ -134,15 +142,72 @@ def publish_event(
     event: object,
     *,
     queue: str | None = None,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
 ) -> MessageEnvelope | None:
     """Django transaction-aware override of :func:`pybus.publish_event`."""
-    return _publish_message(event, expected_kind="event", queue=queue)
+    return _publish_message(
+        event,
+        expected_kind="event",
+        queue=queue,
+        message_id=message_id,
+        headers=headers,
+    )
 
 
 def send_command(
     command: object,
     *,
     queue: str | None = None,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
 ) -> MessageEnvelope | None:
     """Django transaction-aware override of :func:`pybus.send_command`."""
-    return _publish_message(command, expected_kind="command", queue=queue)
+    return _publish_message(
+        command,
+        expected_kind="command",
+        queue=queue,
+        message_id=message_id,
+        headers=headers,
+    )
+
+
+def prepare_event(
+    event: object,
+    *,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
+) -> MessageEnvelope:
+    """Prepare an event using the same contract as :func:`pybus.prepare_event`."""
+    return get_bus().prepare_event(event, message_id=message_id, headers=headers)
+
+
+def prepare_command(
+    command: object,
+    *,
+    message_id: str | None = None,
+    headers: Mapping[str, object] | None = None,
+) -> MessageEnvelope:
+    """Prepare a command using the same contract as :func:`pybus.prepare_command`."""
+    return get_bus().prepare_command(command, message_id=message_id, headers=headers)
+
+
+def publish_prepared(
+    envelope: MessageEnvelope,
+    *,
+    queue: str | None = None,
+) -> MessageEnvelope | None:
+    """Publish an exact prepared envelope after the current transaction commits."""
+    bus = get_bus()
+    bus._validate_prepared_envelope(envelope)
+    prepared = MessageEnvelope.from_dict(envelope.to_dict())
+    target_queue = bus._resolve_prepared_queue(queue)
+
+    def callback() -> MessageEnvelope:
+        return bus.publish_prepared(prepared, queue=target_queue)
+
+    transaction = _load_transaction_module()
+    if transaction.get_connection().in_atomic_block:
+        transaction.on_commit(callback)
+        return None
+    return callback()

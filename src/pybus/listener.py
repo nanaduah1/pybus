@@ -3,14 +3,25 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
+import logging
 import time
 
 from pybus.batching import batched_buffer_key
+from pybus.delivery import (
+    CommandDeliveryObserver,
+    CommandDeliveryOutcome,
+    CommandDeliveryStatus,
+)
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
-from pybus.exceptions import HandlerNotFoundError, IndeterminateDeliveryError
+from pybus.exceptions import (
+    DeliveryObservationError,
+    HandlerNotFoundError,
+    IndeterminateDeliveryError,
+    WorkerAbortError,
+)
 from pybus.handlers import ContinueProcessing, HandlerSpec, _handler_spec
-from pybus.messages import RequestMessage, ResponseMessage
+from pybus.messages import CommandMessage, RequestMessage, ResponseMessage
 from pybus.queues import (
     DEFAULT_FAILED_QUEUE_NAME as _DEFAULT_FAILED_QUEUE_NAME,
     DEFAULT_QUEUE_NAME as _DEFAULT_QUEUE_NAME,
@@ -43,6 +54,7 @@ class Listener:
         now_fn: Callable[[], datetime] | None = None,
         topology: QueueTopology | None = None,
         sleep_fn: Callable[[float], None] | None = None,
+        command_delivery_observers: Sequence[CommandDeliveryObserver] = (),
     ) -> None:
         self.transport = transport
         self.dispatcher = dispatcher or Dispatcher()
@@ -52,6 +64,10 @@ class Listener:
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._topology = topology
         self._sleep_fn = sleep_fn or time.sleep
+        self._command_delivery_observers = tuple(command_delivery_observers)
+        if any(not callable(observer) for observer in self._command_delivery_observers):
+            raise TypeError("command_delivery_observers must contain callables")
+        self._logger = logging.getLogger("pybus.listener")
         self._batch_started_at: dict[str, datetime] = {}
         self._batch_retry_after: dict[str, datetime] = {}
 
@@ -66,16 +82,22 @@ class Listener:
 
         try:
             result = self._dispatch(channel_name, envelope)
-        except IndeterminateDeliveryError:
+        except (IndeterminateDeliveryError, WorkerAbortError):
             raise
         except HandlerNotFoundError:
-            self._dead_letter(channel_name, envelope)
+            self._dead_letter(
+                channel_name, envelope, max_retries=self.retry_policy.max_retries
+            )
             return None
         except Exception:
             if self._should_retry(envelope):
-                self._requeue(channel_name, envelope)
+                self._requeue(
+                    channel_name, envelope, max_retries=self.retry_policy.max_retries
+                )
             else:
-                self._dead_letter(channel_name, envelope)
+                self._dead_letter(
+                    channel_name, envelope, max_retries=self.retry_policy.max_retries
+                )
             return None
 
         if envelope.message_kind == RequestMessage.message_kind and isinstance(
@@ -141,7 +163,44 @@ class Listener:
             self._flush_ready_batches()
             return None
 
+        command_max_retries: int | None = None
+        if (
+            message.message_kind == CommandMessage.message_kind
+            and self._command_delivery_observers
+        ):
+            if len(handlers) != 1:
+                self._restore_claimed_command_and_abort(
+                    channel_name,
+                    envelope,
+                    reason="command delivery outcomes require exactly one handler",
+                    error_type=WorkerAbortError,
+                )
+            command_spec = self._spec_for(handlers[0])
+            command_max_retries = (
+                self.retry_policy.max_retries
+                if command_spec.retry_limit is None
+                else command_spec.retry_limit
+            )
+            try:
+                self._notify_command_outcome(
+                    envelope,
+                    status=CommandDeliveryStatus.STARTED,
+                    source_queue=channel_name,
+                    destination_queue=None,
+                    retry_count=self._retry_count(envelope),
+                    max_retries=command_max_retries,
+                )
+            except DeliveryObservationError as exc:
+                self._restore_claimed_command_and_abort(
+                    channel_name,
+                    envelope,
+                    reason="command delivery start observation failed",
+                    error_type=DeliveryObservationError,
+                    cause=exc,
+                )
+
         results: list[object] = []
+        continued = False
         for handler in handlers:
             spec = self._spec_for(handler)
             if self._should_delay(envelope, spec):
@@ -154,11 +213,31 @@ class Listener:
                 return None
 
             if isinstance(result, ContinueProcessing):
-                self._continue_processing(channel_name, envelope, result)
+                self._continue_processing(
+                    channel_name,
+                    envelope,
+                    result,
+                    max_retries=(
+                        self.retry_policy.max_retries
+                        if spec.retry_limit is None
+                        else spec.retry_limit
+                    ),
+                )
+                continued = True
                 results.append(None)
                 continue
 
             results.append(result)
+
+        if command_max_retries is not None and not continued:
+            self._notify_command_outcome(
+                envelope,
+                status=CommandDeliveryStatus.SUCCEEDED,
+                source_queue=channel_name,
+                destination_queue=None,
+                retry_count=self._retry_count(envelope),
+                max_retries=command_max_retries,
+            )
 
         return results[0] if len(results) == 1 else results
 
@@ -196,15 +275,17 @@ class Listener:
         if self._retry_count(envelope) < max_retries:
             if spec.delay > 0:
                 time.sleep(spec.delay)
-            self._requeue(channel_name, envelope)
+            self._requeue(channel_name, envelope, max_retries=max_retries)
             return
-        self._dead_letter(channel_name, envelope)
+        self._dead_letter(channel_name, envelope, max_retries=max_retries)
 
     def _continue_processing(
         self,
         channel_name: str,
         envelope: MessageEnvelope,
         continuation: ContinueProcessing,
+        *,
+        max_retries: int,
     ) -> None:
         target_queue = continuation.queue or channel_name
         if target_queue == self.dead_letter_channel:
@@ -228,6 +309,14 @@ class Listener:
             lambda: self.transport.publish(
                 target_queue, self.serializer.dump(envelope)
             ),
+        )
+        self._notify_command_outcome(
+            envelope,
+            status=CommandDeliveryStatus.CONTINUED,
+            source_queue=channel_name,
+            destination_queue=target_queue,
+            retry_count=self._retry_count(envelope),
+            max_retries=max_retries,
         )
 
     def _flush_ready_batches(self) -> None:
@@ -319,10 +408,10 @@ class Listener:
                     else spec.retry_limit
                 )
                 if self._retry_count(envelope) < max_retries:
-                    self._requeue(buffer_key, envelope)
+                    self._requeue(buffer_key, envelope, max_retries=max_retries)
                     requeued = True
                 else:
-                    self._dead_letter(buffer_key, envelope)
+                    self._dead_letter(buffer_key, envelope, max_retries=max_retries)
             if requeued:
                 self._batch_retry_after[message_type] = self._now_fn() + timedelta(
                     seconds=spec.max_wait
@@ -350,7 +439,13 @@ class Listener:
             is not None
         )
 
-    def _requeue(self, channel_name: str, envelope: MessageEnvelope) -> None:
+    def _requeue(
+        self,
+        channel_name: str,
+        envelope: MessageEnvelope,
+        *,
+        max_retries: int,
+    ) -> None:
         now = self._now_fn()
         retries = self._retry_count(envelope)
         if not self._is_typed(envelope) and isinstance(envelope.payload, dict):
@@ -387,8 +482,22 @@ class Listener:
                 ),
             ),
         )
+        self._notify_command_outcome(
+            envelope,
+            status=CommandDeliveryStatus.RETRY_SCHEDULED,
+            source_queue=channel_name,
+            destination_queue=channel_name,
+            retry_count=retries + 1,
+            max_retries=max_retries,
+        )
 
-    def _dead_letter(self, channel_name: str, envelope: MessageEnvelope) -> None:
+    def _dead_letter(
+        self,
+        channel_name: str,
+        envelope: MessageEnvelope,
+        *,
+        max_retries: int,
+    ) -> None:
         headers = dict(envelope.headers)
         headers["dead_lettered_from"] = channel_name
         self._settle_after_claim(
@@ -414,6 +523,76 @@ class Listener:
                 ),
             ),
         )
+        self._notify_command_outcome(
+            envelope,
+            status=CommandDeliveryStatus.DEAD_LETTERED,
+            source_queue=channel_name,
+            destination_queue=self.dead_letter_channel,
+            retry_count=self._retry_count(envelope),
+            max_retries=max_retries,
+        )
+
+    def _notify_command_outcome(
+        self,
+        envelope: MessageEnvelope,
+        *,
+        status: CommandDeliveryStatus,
+        source_queue: str,
+        destination_queue: str | None,
+        retry_count: int,
+        max_retries: int,
+    ) -> None:
+        if (
+            envelope.message_kind != CommandMessage.message_kind
+            or not self._command_delivery_observers
+        ):
+            return
+        outcome = CommandDeliveryOutcome(
+            status=status,
+            message_id=envelope.message_id,
+            message_type=envelope.message_type,
+            version=envelope.version,
+            source_queue=source_queue,
+            destination_queue=destination_queue,
+            retry_count=retry_count,
+            max_retries=max_retries,
+        )
+        failures: list[Exception] = []
+        for observer in self._command_delivery_observers:
+            try:
+                observer(outcome)
+            except Exception as exc:
+                failures.append(exc)
+                self._logger.exception(
+                    "Command delivery observer failed for %s", envelope.message_id
+                )
+        if failures:
+            raise DeliveryObservationError(
+                "command delivery observer failed after a known message settlement"
+            ) from failures[0]
+
+    def _restore_claimed_command_and_abort(
+        self,
+        channel_name: str,
+        envelope: MessageEnvelope,
+        *,
+        reason: str,
+        error_type: type[WorkerAbortError],
+        cause: Exception | None = None,
+    ) -> None:
+        self._settle_after_claim(
+            "command claim recovery",
+            lambda: self.transport.publish(
+                channel_name,
+                self.serializer.dump(envelope),
+            ),
+        )
+        error = error_type(
+            f"{reason}; the unchanged command was restored before handler execution"
+        )
+        if cause is None:
+            raise error
+        raise error from cause
 
     def _dead_letter_undecodable(
         self,

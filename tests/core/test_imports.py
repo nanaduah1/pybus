@@ -19,6 +19,13 @@ def test_pybus_imports():
     assert pybus.configure_transport is not None
     assert pybus.publish_event is not None
     assert pybus.send_command is not None
+    assert pybus.prepare_event is not None
+    assert pybus.prepare_command is not None
+    assert pybus.publish_prepared is not None
+    assert pybus.CommandDeliveryOutcome is not None
+    assert pybus.CommandDeliveryStatus is not None
+    assert pybus.DeliveryObservationError is not None
+    assert pybus.WorkerAbortError is not None
     assert pybus.request is not None
     assert pybus.event_handler is not None
     assert pybus.command_handler is not None

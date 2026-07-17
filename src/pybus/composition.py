@@ -7,6 +7,7 @@ from threading import Lock
 
 from pybus.bus import Pybus, _set_default_bus
 from pybus.codecs import PayloadCodec
+from pybus.delivery import CommandDeliveryObserver
 from pybus.contracts import Transport
 from pybus.queues import QueueTopology
 from pybus.serializer import JsonSerializer
@@ -34,6 +35,7 @@ class BusConfiguration:
     serializer: JsonSerializer | None = None
     payload_codec: PayloadCodec | None = None
     worker_hook_factories: Sequence[WorkerHookFactory] | None = None
+    command_delivery_observers: Sequence[CommandDeliveryObserver] = ()
     _state: _ConfigurationState = field(
         default_factory=_ConfigurationState,
         init=False,
@@ -64,6 +66,10 @@ class BusConfiguration:
         object.__setattr__(self, "handler_modules", modules)
         object.__setattr__(self, "handler_targets", targets)
         object.__setattr__(self, "worker_hook_factories", hook_factories)
+        observers = tuple(self.command_delivery_observers)
+        if any(not callable(observer) for observer in observers):
+            raise TypeError("command_delivery_observers must contain callables")
+        object.__setattr__(self, "command_delivery_observers", observers)
 
     def create(
         self,
@@ -90,6 +96,7 @@ class BusConfiguration:
             handler_targets=(*modules, *self.handler_targets),
             payload_codec=self.payload_codec,
             worker_hook_factories=self.worker_hook_factories,
+            command_delivery_observers=self.command_delivery_observers,
         )
 
     def configure(self) -> Pybus:

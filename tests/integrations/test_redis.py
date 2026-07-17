@@ -7,6 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 import pybus.integrations.redis as redis_integration
+from pybus import (
+    CommandDeliveryOutcome,
+    CommandDeliveryStatus,
+    command,
+    command_handler,
+)
 from pybus.bus import Pybus
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
@@ -30,6 +36,11 @@ from pybus.messages import EventMessage
 from pybus.registry import Registry
 from pybus.scheduling import configure_scheduler
 from pybus.worker import Worker
+
+
+@command("billing.redis_generate")
+class RedisGenerateBill:
+    student_id: int
 
 
 class FakeRedisClient:
@@ -186,6 +197,53 @@ def test_redis_transport_publish_and_consume() -> None:
 
     assert transport.consume("pybus.jobs") == b"payload"
     assert transport.consume("pybus.jobs") is None
+
+
+def test_redis_preserves_prepared_identity_and_command_retry_outcomes() -> None:
+    outcomes: list[CommandDeliveryOutcome] = []
+    client = FakeRedisClient()
+
+    @command_handler(RedisGenerateBill)
+    def fail(command_message: RedisGenerateBill) -> None:
+        raise RuntimeError("billing unavailable")
+
+    bus = Pybus(
+        transport=RedisTransport(client=client),
+        handler_targets=[fail],
+        command_delivery_observers=[outcomes.append],
+    )
+    prepared = bus.prepare_command(
+        RedisGenerateBill(student_id=7),
+        message_id="job-redis-42",
+    )
+    restored = MessageEnvelope.from_dict(prepared.to_dict())
+    bus.publish_prepared(restored)
+
+    for _ in range(bus.listener.retry_policy.max_retries + 1):
+        assert bus.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert [outcome.status for outcome in outcomes] == [
+        status
+        for retry_count in range(bus.listener.retry_policy.max_retries + 1)
+        for status in (
+            CommandDeliveryStatus.STARTED,
+            (
+                CommandDeliveryStatus.RETRY_SCHEDULED
+                if retry_count < bus.listener.retry_policy.max_retries
+                else CommandDeliveryStatus.DEAD_LETTERED
+            ),
+        )
+    ]
+    assert all(outcome.message_id == "job-redis-42" for outcome in outcomes)
+    assert [
+        outcome.retry_count
+        for outcome in outcomes
+        if outcome.status == CommandDeliveryStatus.RETRY_SCHEDULED
+    ] == list(range(1, bus.listener.retry_policy.max_retries + 1))
+    failed_raw = bus.transport.consume(DEFAULT_FAILED_QUEUE_NAME)
+    failed = MessageEnvelope.from_dict(bus.serializer.loads(failed_raw))
+    assert failed.message_id == "job-redis-42"
+    assert failed.headers["retries"] == bus.listener.retry_policy.max_retries
 
 
 def test_redis_default_and_slow_workers_dispatch_distinct_queues() -> None:
