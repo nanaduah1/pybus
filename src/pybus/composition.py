@@ -8,7 +8,7 @@ from threading import Lock
 from pybus.bus import Pybus, _set_default_bus
 from pybus.codecs import PayloadCodec
 from pybus.delivery import CommandDeliveryObserver
-from pybus.durable import DurableCommandPolicy, DurableCommandStore
+from pybus.durable import DurableJobPolicy, DurableJobStore
 from pybus.contracts import Transport
 from pybus.queues import QueueTopology
 from pybus.serializer import JsonSerializer
@@ -17,7 +17,14 @@ from pybus.worker import WorkerHook
 
 TransportFactory = Callable[[], Transport]
 WorkerHookFactory = Callable[[], WorkerHook]
-DurableCommandStoreFactory = Callable[[], DurableCommandStore]
+DurableJobStoreFactory = Callable[[], DurableJobStore]
+
+
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
 
 
 class _ConfigurationState:
@@ -26,7 +33,7 @@ class _ConfigurationState:
         self.bus: Pybus | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class BusConfiguration:
     """Reusable application choices for isolated and process-default buses."""
 
@@ -38,9 +45,13 @@ class BusConfiguration:
     payload_codec: PayloadCodec | None = None
     worker_hook_factories: Sequence[WorkerHookFactory] | None = None
     command_delivery_observers: Sequence[CommandDeliveryObserver] = ()
-    durable_command_store_factory: DurableCommandStoreFactory | None = None
-    durable_command_policy: DurableCommandPolicy = field(
-        default_factory=DurableCommandPolicy
+    _durable_job_store_factory: DurableJobStoreFactory | None = field(
+        default=None,
+        repr=False,
+    )
+    _durable_job_policy: DurableJobPolicy = field(
+        default_factory=DurableJobPolicy,
+        repr=False,
     )
     _state: _ConfigurationState = field(
         default_factory=_ConfigurationState,
@@ -49,15 +60,100 @@ class BusConfiguration:
         compare=False,
     )
 
+    def __init__(
+        self,
+        transport_factory: TransportFactory,
+        topology: QueueTopology | None = None,
+        handler_modules: Sequence[str] = (),
+        handler_targets: Sequence[object] = (),
+        serializer: JsonSerializer | None = None,
+        payload_codec: PayloadCodec | None = None,
+        worker_hook_factories: Sequence[WorkerHookFactory] | None = None,
+        command_delivery_observers: Sequence[CommandDeliveryObserver] = (),
+        durable_job_store_factory: DurableJobStoreFactory | None | _Unset = _UNSET,
+        durable_job_policy: DurableJobPolicy | None | _Unset = _UNSET,
+        *,
+        durable_command_store_factory: DurableJobStoreFactory | None | _Unset = _UNSET,
+        durable_command_policy: DurableJobPolicy | None | _Unset = _UNSET,
+        _durable_job_store_factory: DurableJobStoreFactory | None | _Unset = _UNSET,
+        _durable_job_policy: DurableJobPolicy | None | _Unset = _UNSET,
+    ) -> None:
+        if (
+            durable_job_store_factory is not _UNSET
+            and durable_command_store_factory is not _UNSET
+        ):
+            raise TypeError(
+                "durable_job_store_factory and durable_command_store_factory "
+                "cannot both be supplied"
+            )
+        if durable_job_policy is not _UNSET and durable_command_policy is not _UNSET:
+            raise TypeError(
+                "durable_job_policy and durable_command_policy cannot both be supplied"
+            )
+        resolved_factory = (
+            durable_job_store_factory
+            if durable_job_store_factory is not _UNSET
+            else durable_command_store_factory
+            if durable_command_store_factory is not _UNSET
+            else _durable_job_store_factory
+            if _durable_job_store_factory is not _UNSET
+            else None
+        )
+        resolved_policy = (
+            durable_job_policy
+            if durable_job_policy is not _UNSET
+            else durable_command_policy
+            if durable_command_policy is not _UNSET
+            else _durable_job_policy
+            if _durable_job_policy is not _UNSET
+            else None
+        )
+        if resolved_policy is None:
+            resolved_policy = DurableJobPolicy()
+        object.__setattr__(self, "transport_factory", transport_factory)
+        object.__setattr__(self, "topology", topology or QueueTopology())
+        object.__setattr__(self, "handler_modules", handler_modules)
+        object.__setattr__(self, "handler_targets", handler_targets)
+        object.__setattr__(self, "serializer", serializer)
+        object.__setattr__(self, "payload_codec", payload_codec)
+        object.__setattr__(self, "worker_hook_factories", worker_hook_factories)
+        object.__setattr__(
+            self, "command_delivery_observers", command_delivery_observers
+        )
+        object.__setattr__(self, "_durable_job_store_factory", resolved_factory)
+        object.__setattr__(self, "_durable_job_policy", resolved_policy)
+        object.__setattr__(self, "_state", _ConfigurationState())
+        self.__post_init__()
+
+    @property
+    def durable_job_store_factory(self) -> DurableJobStoreFactory | None:
+        return self._durable_job_store_factory
+
+    @property
+    def durable_job_policy(self) -> DurableJobPolicy:
+        return self._durable_job_policy
+
+    @property
+    def durable_command_store_factory(self) -> DurableJobStoreFactory | None:
+        """Compatibility alias for :attr:`durable_job_store_factory`."""
+
+        return self.durable_job_store_factory
+
+    @property
+    def durable_command_policy(self) -> DurableJobPolicy:
+        """Compatibility alias for :attr:`durable_job_policy`."""
+
+        return self.durable_job_policy
+
     def __post_init__(self) -> None:
         if not callable(self.transport_factory):
             raise TypeError("transport_factory must be callable")
-        if self.durable_command_store_factory is not None and not callable(
-            self.durable_command_store_factory
+        if self.durable_job_store_factory is not None and not callable(
+            self.durable_job_store_factory
         ):
-            raise TypeError("durable_command_store_factory must be callable")
-        if not isinstance(self.durable_command_policy, DurableCommandPolicy):
-            raise TypeError("durable_command_policy must be a DurableCommandPolicy")
+            raise TypeError("durable_job_store_factory must be callable")
+        if not isinstance(self.durable_job_policy, DurableJobPolicy):
+            raise TypeError("durable_job_policy must be a DurableJobPolicy")
 
         if isinstance(self.handler_modules, (str, bytes)):
             raise TypeError("handler_modules must be a sequence of module paths")
@@ -109,12 +205,12 @@ class BusConfiguration:
             payload_codec=self.payload_codec,
             worker_hook_factories=self.worker_hook_factories,
             command_delivery_observers=self.command_delivery_observers,
-            durable_command_store=(
+            durable_job_store=(
                 None
-                if self.durable_command_store_factory is None
-                else self.durable_command_store_factory()
+                if self.durable_job_store_factory is None
+                else self.durable_job_store_factory()
             ),
-            durable_command_policy=self.durable_command_policy,
+            durable_job_policy=self.durable_job_policy,
         )
 
     def configure(self) -> Pybus:
@@ -141,7 +237,11 @@ def _validate_transport(transport: object) -> None:
 
 __all__ = [
     "BusConfiguration",
-    "DurableCommandStoreFactory",
+    "DurableJobStoreFactory",
     "TransportFactory",
     "WorkerHookFactory",
 ]
+
+
+DurableCommandStoreFactory = DurableJobStoreFactory
+__all__.append("DurableCommandStoreFactory")

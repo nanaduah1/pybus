@@ -20,8 +20,10 @@ def test_pybus_imports():
     assert pybus.publish_event is not None
     assert pybus.send_command is not None
     assert pybus.schedule_command is not None
-    assert pybus.DurableCommandStore is not None
-    assert pybus.DurableCommandState is not None
+    assert pybus.DurableJobStore is not None
+    assert pybus.DurableJobState is not None
+    assert pybus.DurableCommandStore is pybus.DurableJobStore
+    assert pybus.RecurringCommandSeriesHandle is pybus.JobSeriesHandle
     assert pybus.prepare_event is not None
     assert pybus.prepare_command is not None
     assert pybus.publish_prepared is not None
@@ -55,6 +57,8 @@ def test_core_imports_do_not_load_optional_django_or_redis() -> None:
         sys.meta_path.insert(0, BlockOptionalImports())
         sys.path.insert(0, {str(source_root)!r})
         import pybus
+        from pybus.durable import DurableCommandStore, DurableJobStore
+        from pybus.recurrence import JobSeriesStore, RecurringCommandStore
         import pybus.scheduling
         from pybus.integrations.redis import RedisScheduleStateStore
         import pybus.worker
@@ -68,6 +72,8 @@ def test_core_imports_do_not_load_optional_django_or_redis() -> None:
 
         RedisScheduleStateStore(client=FakeRedis())
         assert pybus.Worker is pybus.worker.Worker
+        assert DurableCommandStore is DurableJobStore
+        assert RecurringCommandStore is JobSeriesStore
         """
     )
 

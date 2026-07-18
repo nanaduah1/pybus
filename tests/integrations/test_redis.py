@@ -276,7 +276,7 @@ def test_redis_durable_metadata_survives_retry_and_dead_letter_copies() -> None:
     bus = Pybus(
         transport=RedisTransport(client=client),
         handler_targets=[fail],
-        durable_command_store=PermissiveDurableStore(),
+        durable_job_store=PermissiveDurableStore(),
     )
     bus.listener.retry_policy = RetryPolicy(max_retries=1)
     prepared = bus.prepare_command(
@@ -321,7 +321,7 @@ def test_redis_durable_metadata_survives_continuation_copy() -> None:
     bus = Pybus(
         transport=RedisTransport(client=client),
         handler_targets=[continue_slowly],
-        durable_command_store=PermissiveDurableStore(),
+        durable_job_store=PermissiveDurableStore(),
     )
     prepared = bus.prepare_command(
         RedisGenerateBill(student_id=9), message_id="redis-durable-continuation"

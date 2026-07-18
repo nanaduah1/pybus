@@ -41,13 +41,27 @@ class DeliveryObservationError(WorkerAbortError):
     """Raised when delivery observers fail before or after a known settlement."""
 
 
-class DurableCommandsNotConfiguredError(PybusError):
-    """Raised when durable command APIs are used without a durable store."""
+class DurableJobsNotConfiguredError(PybusError):
+    """Raised when durable job APIs are used without a durable job store."""
 
 
-class DurableCommandConflictError(PybusError):
-    """Raised when an idempotency key identifies a different command."""
+class DurableJobConflictError(PybusError):
+    """Raised when an idempotency key identifies a different durable job."""
+
+
+class JobSeriesNotSupportedError(PybusError):
+    """Raised when recurrence is used with a one-off-only durable store."""
+
+
+class JobSeriesNotFoundError(LookupError, PybusError):
+    """Raised when a job series cannot be found."""
 
 
 class InvalidMessageDefinitionError(ValueError, PybusError):
     """Raised when a message or envelope definition is invalid."""
+
+
+DurableCommandsNotConfiguredError = DurableJobsNotConfiguredError
+DurableCommandConflictError = DurableJobConflictError
+DurableRecurrenceNotSupportedError = JobSeriesNotSupportedError
+RecurringCommandSeriesNotFoundError = JobSeriesNotFoundError

@@ -12,13 +12,19 @@ from uuid import uuid4
 from pybus.envelope import MessageEnvelope
 from pybus.delivery import CommandDeliveryOutcome, CommandDeliveryStatus
 from pybus.exceptions import IndeterminateDeliveryError
+from pybus.exceptions import InvalidMessageDefinitionError
+from pybus.recurrence import (
+    EndRecurrence,
+    JobSeriesStore,
+    ScheduleNextOccurrence,
+)
 
 
 DURABLE_RECORD_HEADER = "pybus_durable_record"
 DURABLE_GENERATION_HEADER = "pybus_durable_generation"
 
 
-class DurableCommandState(StrEnum):
+class DurableJobState(StrEnum):
     PENDING = "pending"
     CLAIMED = "claimed"
     PUBLISHED = "published"
@@ -27,6 +33,7 @@ class DurableCommandState(StrEnum):
     INDETERMINATE = "indeterminate"
     SUCCEEDED = "succeeded"
     DEAD_LETTERED = "dead_lettered"
+    CANCELLED = "cancelled"
 
 
 class DurableDeliveryDecision(StrEnum):
@@ -36,7 +43,7 @@ class DurableDeliveryDecision(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class DurableCommandDraft:
+class DurableJobDraft:
     message_id: str
     message_type: str
     version: int
@@ -50,7 +57,7 @@ class DurableCommandDraft:
 
 
 @dataclass(frozen=True, slots=True)
-class DurableCommandRecord:
+class DurableJobRecord:
     id: str
     message_id: str
     message_type: str
@@ -62,7 +69,7 @@ class DurableCommandRecord:
     queue: str
     fingerprint: str
     idempotency_key: str | None
-    state: DurableCommandState = DurableCommandState.PENDING
+    state: DurableJobState = DurableJobState.PENDING
     generation: int = 0
     retry_count: int = 0
     lease_owner: str | None = None
@@ -75,9 +82,11 @@ class DurableCommandRecord:
     last_attempt_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    series_id: str | None = None
+    occurrence_number: int | None = None
 
     @classmethod
-    def from_draft(cls, draft: DurableCommandDraft) -> DurableCommandRecord:
+    def from_draft(cls, draft: DurableJobDraft) -> DurableJobRecord:
         return cls(
             id=str(uuid4()),
             message_id=draft.message_id,
@@ -94,7 +103,7 @@ class DurableCommandRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class DurableCommandClaim:
+class DurableJobClaim:
     id: str
     message_id: str
     message_type: str
@@ -110,7 +119,7 @@ class DurableCommandClaim:
     last_attempt_at: datetime | None = None
 
     @classmethod
-    def from_record(cls, record: DurableCommandRecord) -> DurableCommandClaim:
+    def from_record(cls, record: DurableJobRecord) -> DurableJobClaim:
         return cls(
             id=record.id,
             message_id=record.message_id,
@@ -151,27 +160,36 @@ class DurableCommandClaim:
 
 
 @dataclass(frozen=True, slots=True)
-class DurableCommandHandle:
+class DurableJobHandle:
     id: str
     message_id: str
-    state: DurableCommandState
+    state: DurableJobState
     created_at: datetime
+    series_id: str | None = None
+    occurrence_number: int | None = None
 
     @classmethod
-    def from_record(cls, record: DurableCommandRecord) -> DurableCommandHandle:
-        return cls(record.id, record.message_id, record.state, record.created_at)
+    def from_record(cls, record: DurableJobRecord) -> DurableJobHandle:
+        return cls(
+            record.id,
+            record.message_id,
+            record.state,
+            record.created_at,
+            record.series_id,
+            record.occurrence_number,
+        )
 
 
-class DurableCommandStore(Protocol):
-    def schedule(self, draft: DurableCommandDraft) -> DurableCommandRecord: ...
+class DurableJobStore(Protocol):
+    def schedule(self, draft: DurableJobDraft) -> DurableJobRecord: ...
 
     def claim(
         self, *, worker_id: str, now: datetime, lease_expires_at: datetime
-    ) -> DurableCommandClaim | None: ...
+    ) -> DurableJobClaim | None: ...
 
     def mark_published(
         self,
-        claim: DurableCommandClaim,
+        claim: DurableJobClaim,
         *,
         now: datetime,
         reconciliation_due_at: datetime,
@@ -179,7 +197,7 @@ class DurableCommandStore(Protocol):
 
     def mark_publish_indeterminate(
         self,
-        claim: DurableCommandClaim,
+        claim: DurableJobClaim,
         *,
         now: datetime,
         reconciliation_due_at: datetime,
@@ -238,7 +256,7 @@ class DurableSettlement:
 
 
 @dataclass(frozen=True, slots=True)
-class DurableCommandPolicy:
+class DurableJobPolicy:
     lease_duration: timedelta = timedelta(seconds=30)
     reconciliation_delay: timedelta = timedelta(minutes=5)
 
@@ -249,21 +267,21 @@ class DurableCommandPolicy:
             raise ValueError("reconciliation_delay must be positive")
 
 
-class DurableCommandRunner:
+class DurableJobRunner:
     def __init__(
         self,
-        store: DurableCommandStore,
+        store: DurableJobStore,
         publisher: Callable[[MessageEnvelope, str], object],
         *,
-        policy: DurableCommandPolicy | None = None,
+        policy: DurableJobPolicy | None = None,
         worker_id: str | None = None,
     ) -> None:
         self.store = store
         self.publisher = publisher
-        self.policy = policy or DurableCommandPolicy()
+        self.policy = policy or DurableJobPolicy()
         self.worker_id = worker_id or str(uuid4())
 
-    def run_once(self) -> DurableCommandClaim | None:
+    def run_once(self) -> DurableJobClaim | None:
         now = datetime.now(timezone.utc)
         claim = self.store.claim(
             worker_id=self.worker_id,
@@ -285,10 +303,10 @@ class DurableCommandRunner:
                 )
             except Exception as state_exc:
                 raise IndeterminateDeliveryError(
-                    f"Durable command publication and state are indeterminate for {claim.id}"
+                    f"Durable job publication and state are indeterminate for {claim.id}"
                 ) from state_exc
             raise IndeterminateDeliveryError(
-                f"Durable command publication is indeterminate for {claim.id}"
+                f"Durable job publication is indeterminate for {claim.id}"
             ) from exc
         published_at = datetime.now(timezone.utc)
         try:
@@ -299,15 +317,13 @@ class DurableCommandRunner:
             )
         except Exception as exc:
             raise IndeterminateDeliveryError(
-                f"Durable command publication state is indeterminate for {claim.id}"
+                f"Durable job publication state is indeterminate for {claim.id}"
             ) from exc
         return claim
 
 
-class DurableCommandController:
-    def __init__(
-        self, store: DurableCommandStore, policy: DurableCommandPolicy
-    ) -> None:
+class DurableJobController:
+    def __init__(self, store: DurableJobStore, policy: DurableJobPolicy) -> None:
         self.store = store
         self.policy = policy
 
@@ -430,15 +446,36 @@ class DurableCommandController:
                 + self.policy.reconciliation_delay,
             )
 
+    def complete_success(
+        self,
+        outcome: CommandDeliveryOutcome,
+        handler_result: object,
+        *,
+        completed_at: datetime,
+    ) -> None:
+        if isinstance(self.store, JobSeriesStore):
+            handled = self.store.complete_recurring_success(
+                outcome,
+                handler_result,
+                completed_at=completed_at,
+            )
+            if handled:
+                return
+        if isinstance(handler_result, (ScheduleNextOccurrence, EndRecurrence)):
+            raise InvalidMessageDefinitionError(
+                "recurrence results require a recurring durable job"
+            )
+        self.apply_outcome(outcome)
 
-class DurableCommandPoller:
+
+class DurableJobPoller:
     """Adapt a durable runner to the regular worker lifecycle."""
 
     dead_letter_channel = "__pybus_durable_terminal__"
 
     def __init__(
         self,
-        runner: DurableCommandRunner,
+        runner: DurableJobRunner,
         *,
         idle_delay: float = 1.0,
         stop_event: Event | None = None,
@@ -461,9 +498,31 @@ class DurableCommandPoller:
         return result
 
 
+DurableCommandState = DurableJobState
+DurableCommandDraft = DurableJobDraft
+DurableCommandRecord = DurableJobRecord
+DurableCommandClaim = DurableJobClaim
+DurableCommandHandle = DurableJobHandle
+DurableCommandStore = DurableJobStore
+DurableCommandPolicy = DurableJobPolicy
+DurableCommandRunner = DurableJobRunner
+DurableCommandController = DurableJobController
+DurableCommandPoller = DurableJobPoller
+
+
 __all__ = [
     "DURABLE_GENERATION_HEADER",
     "DURABLE_RECORD_HEADER",
+    "DurableJobClaim",
+    "DurableJobController",
+    "DurableJobDraft",
+    "DurableJobHandle",
+    "DurableJobPolicy",
+    "DurableJobPoller",
+    "DurableJobRecord",
+    "DurableJobRunner",
+    "DurableJobState",
+    "DurableJobStore",
     "DurableCommandClaim",
     "DurableCommandController",
     "DurableCommandDraft",

@@ -459,32 +459,67 @@ reconciliation by stable message ID rather than treating callbacks as a durable
 acknowledgement. Events, requests, responses, and batched delivery do not emit
 these outcomes in version one.
 
-### 4.2 Durable typed commands
+### 4.2 Durable jobs for typed commands
 
 The opt-in durable path persists a typed command before publication:
 
 ```python
-handle = pybus.schedule_command(command, idempotency_key=None)
-bus.create_durable_command_worker().run()
+handle = pybus.schedule_command(
+    command,
+    run_at=None,
+    recurrence=None,
+    idempotency_key=None,
+)
+bus.create_durable_job_worker().run()
 ```
 
 `send_command()` remains the immediate transport API. `schedule_command()` has
-no queue, header, or timing controls: routing is declared on the command and
-scheduling stores the canonical logical envelope without transport I/O.
-Without a configured `durable_command_store_factory` (or low-level
-`durable_command_store`), both durable APIs raise
-`DurableCommandsNotConfiguredError`.
+routing declared on the command and stores the canonical logical envelope
+without transport I/O. With no timing context it is immediately eligible;
+`run_at` is an aware eligibility timestamp, so a future value defers a one-off
+and a value at or before the current time is immediately eligible.
+Without a configured `durable_job_store_factory` (or low-level
+`durable_job_store`), both durable APIs raise
+`DurableJobsNotConfiguredError`.
 
-`DurableCommandPolicy` configures publisher-claim lease duration and the
+An optional `Recurrence` adds a durable series lifecycle to that same command:
+
+```python
+recurrence = pybus.Recurrence(
+    cadence=pybus.RecurrenceCadence.MONTHLY,
+    timezone="Africa/Accra",
+    ends_at=None,
+)
+handle = pybus.schedule_command(command, run_at=first_run, recurrence=recurrence)
+```
+
+Daily, weekly, and monthly cadences preserve the first run's local wall-clock
+anchor. Monthly schedules clamp missing days without drift; timezone gaps move
+forward by the transition gap and folds choose the earlier instant. Successful
+`None` creates the first anchored slot strictly after completion, skipping
+missed slots. `ScheduleNextOccurrence(at=...)` overrides only the next run;
+`EndRecurrence()` completes the series. An aware `ends_at` is exclusive.
+`cancel_recurring_command(handle.series_id)` is idempotent and prevents a
+terminal or cancelled series from producing another occurrence.
+
+Each occurrence is a durable job carrying an ordinary command, with a distinct
+message ID and monotonic occurrence number. The command remains the application
+intent and the job is its delivery lifecycle. Success and its single successor
+are committed in one store transaction. Retry and `ContinueProcessing` retain
+the current occurrence; dead-lettering fails the series. These guarantees
+prevent duplicate successors, but domain handler execution remains
+at-least-once.
+
+`DurableJobPolicy` configures publisher-claim lease duration and the
 reconciliation delay used by publishers and consumers. It is set once on
-`BusConfiguration`; `create_durable_command_worker(policy=...)` may override it
+`BusConfiguration`; `create_durable_job_worker(policy=...)` may override it
 for one publisher. Until lease renewal exists, applications should size the
 reconciliation delay above their normal end-to-end command duration.
 
 The core store protocol and state types do not import Django. The first
 production implementation is the separate, opt-in
 `pybus.integrations.django_durable` app. It is atomic with application writes
-only when `DjangoDurableCommandStore(using=...)` uses the same database alias as
+only when `DjangoDurableJobStore(using=...)` uses the same database alias as
 the caller's transaction.
 
 Each claim increments a generation and publishes a copy carrying reserved
@@ -498,6 +533,13 @@ conservative retry floor.
 This is an at-least-once contract across the database/transport boundary, not
 exactly-once execution. Handlers remain responsible for idempotent domain side
 effects.
+
+The durable execution is a job; its payload remains a typed command. The
+command-oriented durability names are exact compatibility aliases during
+`0.1.x` and may be removed in `0.2.0`. Canonical configuration uses
+`durable_job_store`, `durable_job_store_factory`, and `durable_job_policy`.
+Supplying a canonical and legacy spelling together is an error, including when
+one was explicitly set to `None`.
 
 ---
 

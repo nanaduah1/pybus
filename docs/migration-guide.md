@@ -245,6 +245,21 @@ pass can legitimately need more work so the native worker cannot tight-loop.
 This delay blocks the worker and is not durable scheduling; keep long waits in
 the scheduler and preserve an application-level progress or stall ceiling.
 
+Applications using the optional Django durable-command store should apply its
+new migrations before scheduling recurring work. Existing one-off rows remain
+valid. A future one-off uses `schedule_command(command, run_at=...)`; recurring
+work adds `recurrence=Recurrence(...)` to the same call. Do not reverse the
+recurrence migration while any series data remains—the guarded reverse refuses
+to discard it.
+
+For `0.1.x`, migrate application configuration from
+`DjangoDurableCommandStore`/`durable_command_store_factory` to
+`DjangoDurableJobStore`/`durable_job_store_factory`, and start publishers with
+`create_durable_job_worker()`. The old spellings are exact compatibility aliases
+until `0.2.0`; do not supply old and new configuration keywords together. The
+job-ontology migration changes Django model state without renaming physical
+tables or changing stored identities.
+
 Outbox/inbox flows should be treated as a durability upgrade path, not as a
 new core capability in v1.
 

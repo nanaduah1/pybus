@@ -103,10 +103,10 @@ versions have the same inputs; `publish_prepared` defers the already-created
 envelope until commit, so rollback publishes nothing and retrying from stored
 JSON preserves its identity.
 
-## Durable typed commands
+## Durable jobs for typed commands
 
-Use the opt-in Django durable-command app when a one-off typed command must be
-committed before any transport publication:
+Use the opt-in Django durable-command app when a typed command must be committed
+before any transport publication:
 
 ```python
 # settings.py
@@ -118,11 +118,11 @@ alias as the transaction that schedules work:
 
 ```python
 from pybus import BusConfiguration
-from pybus.integrations.django_durable.store import DjangoDurableCommandStore
+from pybus.integrations.django_durable.store import DjangoDurableJobStore
 
 APPLICATION_BUS = BusConfiguration(
     transport_factory=create_transport,
-    durable_command_store_factory=lambda: DjangoDurableCommandStore(
+    durable_job_store_factory=lambda: DjangoDurableJobStore(
         using="default"
     ),
 )
@@ -140,10 +140,41 @@ handle = pybus.schedule_command(GenerateBill(student_id=7))
 Pass an `idempotency_key` only when intentional schedule deduplication is
 required.
 
+The same operation can defer a one-off command or attach a recurring lifecycle:
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from pybus import Recurrence, RecurrenceCadence
+
+
+first_run = datetime(2026, 7, 31, 9, tzinfo=ZoneInfo("Africa/Accra"))
+handle = pybus.schedule_command(
+    GenerateBill(student_id=7),
+    run_at=first_run,
+    recurrence=Recurrence(
+        cadence=RecurrenceCadence.MONTHLY,
+        timezone="Africa/Accra",
+    ),
+    idempotency_key="monthly-bill:7",
+)
+```
+
+`run_at` is an optional aware eligibility timestamp: without recurrence it is a
+one-off, and a value at or before the current time is immediately eligible.
+With recurrence, daily, weekly, and monthly schedules retain the original local
+wall-clock anchor, skip missed slots, and create only one successor after a
+successful occurrence. A recurring handler returns `None` for the default
+cadence, `ScheduleNextOccurrence(at=...)` to override only the next run, or
+`EndRecurrence()` to finish. Call `cancel_recurring_command(handle.series_id)`
+to stop an active series. Times must be timezone-aware; `ends_at` is an optional
+exclusive boundary.
+
 Run a durable publisher separately from the ordinary command consumer:
 
 ```python
-bus.create_durable_command_worker().run()  # claims and publishes
+bus.create_durable_job_worker().run()  # claims and publishes
 bus.create_worker().run()                  # invokes typed handlers
 ```
 
@@ -151,14 +182,19 @@ The contract is at-least-once. Generation fencing prevents stale transport
 copies from invoking handlers, but handlers must still be idempotent or protect
 domain side effects with an inbox/domain guard. An idempotency key identifies
 one canonical command; reusing it for different content raises
-`DurableCommandConflictError`. To disable the feature, stop its publisher and
+`DurableJobConflictError`. To disable the feature, stop its publisher and
 remove its store configuration while retaining the table for recovery.
 
-`DurableCommandPolicy` configures publisher-claim leases and the delay before a
+`DurableJobPolicy` configures publisher-claim leases and the delay before a
 missing publication or handler outcome becomes eligible for reconciliation.
 Size the reconciliation delay above normal end-to-end command duration until a
 later release adds lease renewal. Configure it on `BusConfiguration`, or pass a
-one-worker override to `create_durable_command_worker(policy=...)`.
+one-worker override to `create_durable_job_worker(policy=...)`.
+
+The earlier command-oriented durability names remain direct compatibility
+aliases throughout `0.1.x` (`DurableCommandStore`, `DjangoDurableCommandStore`,
+`durable_command_store`, and `create_durable_command_worker`). New code should
+use the job-oriented names; the aliases are eligible for removal in `0.2.0`.
 
 ## Reusable application composition
 

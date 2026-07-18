@@ -209,6 +209,36 @@ They do not change legacy handlers or payloads. Observers are process-local,
 metadata-only reconciliation signals and do not strengthen the destructive-pop
 transport into exactly-once or crash-safe delivery.
 
-These shims are temporary and should be clearly marked deprecated when used.
+Durable timing and recurrence are likewise additive. Existing
+`schedule_command(command, idempotency_key=...)` calls keep their immediate
+one-off behavior and existing fingerprint shape. `run_at=` opts into future
+eligibility; `recurrence=` opts into a separate series lifecycle. Neither adds
+fields to transport envelopes or changes `send_command()`, retry, continuation,
+or observer outcome shapes.
+
+Durability storage uses job terminology beginning with the recurring-command
+slice. During `0.1.x`, the former names are direct aliases:
+
+| Compatibility name | Canonical name |
+|---|---|
+| `DurableCommand*` | `DurableJob*` |
+| `RecurringCommandSeries*` | `JobSeries*` |
+| `RecurringCommandStore` | `JobSeriesStore` |
+| `DjangoDurableCommandStore` | `DjangoDurableJobStore` |
+| `durable_command_store` | `durable_job_store` |
+| `durable_command_store_factory` | `durable_job_store_factory` |
+| `durable_command_policy` | `durable_job_policy` |
+| `create_durable_command_worker` | `create_durable_job_worker` |
+
+Aliases preserve Python object identity and behavior without parallel
+implementations. They may be removed in `0.2.0`. Physical database table names,
+Django app/module paths, command envelopes, headers, queue names, and worker
+identity remain unchanged. The post-rename Django app registry exposes
+`DurableJob` and `JobSeries`; historical string lookups for the old model labels
+are not a compatibility surface.
+
+These job-ontology aliases are deprecated as naming surfaces throughout
+`0.1.x`, but do not emit runtime deprecation warnings. Their documented removal
+target is `0.2.0`.
 Native `Worker` input must never include the terminal failed queue; legacy
 failed-queue processing requires an explicit compatibility/redrive adapter.
