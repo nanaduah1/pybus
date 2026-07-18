@@ -8,6 +8,7 @@ from threading import Lock
 from pybus.bus import Pybus, _set_default_bus
 from pybus.codecs import PayloadCodec
 from pybus.delivery import CommandDeliveryObserver
+from pybus.durable import DurableCommandPolicy, DurableCommandStore
 from pybus.contracts import Transport
 from pybus.queues import QueueTopology
 from pybus.serializer import JsonSerializer
@@ -16,6 +17,7 @@ from pybus.worker import WorkerHook
 
 TransportFactory = Callable[[], Transport]
 WorkerHookFactory = Callable[[], WorkerHook]
+DurableCommandStoreFactory = Callable[[], DurableCommandStore]
 
 
 class _ConfigurationState:
@@ -36,6 +38,10 @@ class BusConfiguration:
     payload_codec: PayloadCodec | None = None
     worker_hook_factories: Sequence[WorkerHookFactory] | None = None
     command_delivery_observers: Sequence[CommandDeliveryObserver] = ()
+    durable_command_store_factory: DurableCommandStoreFactory | None = None
+    durable_command_policy: DurableCommandPolicy = field(
+        default_factory=DurableCommandPolicy
+    )
     _state: _ConfigurationState = field(
         default_factory=_ConfigurationState,
         init=False,
@@ -46,6 +52,12 @@ class BusConfiguration:
     def __post_init__(self) -> None:
         if not callable(self.transport_factory):
             raise TypeError("transport_factory must be callable")
+        if self.durable_command_store_factory is not None and not callable(
+            self.durable_command_store_factory
+        ):
+            raise TypeError("durable_command_store_factory must be callable")
+        if not isinstance(self.durable_command_policy, DurableCommandPolicy):
+            raise TypeError("durable_command_policy must be a DurableCommandPolicy")
 
         if isinstance(self.handler_modules, (str, bytes)):
             raise TypeError("handler_modules must be a sequence of module paths")
@@ -97,6 +109,12 @@ class BusConfiguration:
             payload_codec=self.payload_codec,
             worker_hook_factories=self.worker_hook_factories,
             command_delivery_observers=self.command_delivery_observers,
+            durable_command_store=(
+                None
+                if self.durable_command_store_factory is None
+                else self.durable_command_store_factory()
+            ),
+            durable_command_policy=self.durable_command_policy,
         )
 
     def configure(self) -> Pybus:
@@ -121,4 +139,9 @@ def _validate_transport(transport: object) -> None:
         )
 
 
-__all__ = ["BusConfiguration", "TransportFactory", "WorkerHookFactory"]
+__all__ = [
+    "BusConfiguration",
+    "DurableCommandStoreFactory",
+    "TransportFactory",
+    "WorkerHookFactory",
+]

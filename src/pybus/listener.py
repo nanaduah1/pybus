@@ -14,6 +14,7 @@ from pybus.delivery import (
 )
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
+from pybus.durable import DurableCommandController, DurableDeliveryDecision
 from pybus.exceptions import (
     DeliveryObservationError,
     HandlerNotFoundError,
@@ -55,6 +56,7 @@ class Listener:
         topology: QueueTopology | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         command_delivery_observers: Sequence[CommandDeliveryObserver] = (),
+        durable_command_controller: DurableCommandController | None = None,
     ) -> None:
         self.transport = transport
         self.dispatcher = dispatcher or Dispatcher()
@@ -65,6 +67,7 @@ class Listener:
         self._topology = topology
         self._sleep_fn = sleep_fn or time.sleep
         self._command_delivery_observers = tuple(command_delivery_observers)
+        self._durable_command_controller = durable_command_controller
         if any(not callable(observer) for observer in self._command_delivery_observers):
             raise TypeError("command_delivery_observers must contain callables")
         self._logger = logging.getLogger("pybus.listener")
@@ -79,6 +82,8 @@ class Listener:
         channel_name, envelope = self._consume_envelope(active_channels)
         if envelope is None:
             return None
+
+        self._verify_durable_configuration(channel_name, envelope)
 
         try:
             result = self._dispatch(channel_name, envelope)
@@ -105,6 +110,73 @@ class Listener:
         ):
             self._publish_response(envelope, result)
         return result
+
+    def _verify_durable_configuration(
+        self, channel_name: str, envelope: MessageEnvelope
+    ) -> None:
+        try:
+            identity = DurableCommandController.identity(envelope)
+        except Exception as exc:
+            self._restore_claimed_command_and_abort(
+                channel_name,
+                envelope,
+                reason="durable command metadata is invalid",
+                error_type=WorkerAbortError,
+                cause=exc,
+            )
+        if identity is not None and self._durable_command_controller is None:
+            self._restore_claimed_command_and_abort(
+                channel_name,
+                envelope,
+                reason="durable command store is not configured on this worker",
+                error_type=WorkerAbortError,
+            )
+        if (
+            identity is not None
+            and envelope.message_kind != CommandMessage.message_kind
+        ):
+            self._restore_claimed_command_and_abort(
+                channel_name,
+                envelope,
+                reason="durable delivery metadata is valid only on commands",
+                error_type=WorkerAbortError,
+            )
+
+    def _admit_durable_delivery(
+        self,
+        channel_name: str,
+        envelope: MessageEnvelope,
+        *,
+        max_retries: int,
+    ) -> bool:
+        if self._durable_command_controller is None:
+            return True
+        try:
+            decision = self._durable_command_controller.admit(
+                envelope,
+                source_queue=channel_name,
+                retry_count=self._retry_count(envelope),
+                max_retries=max_retries,
+            )
+        except Exception as exc:
+            self._restore_claimed_command_and_abort(
+                channel_name,
+                envelope,
+                reason="durable command admission failed",
+                error_type=WorkerAbortError,
+                cause=exc,
+            )
+        if decision is None or decision == DurableDeliveryDecision.PROCEED:
+            return True
+        if decision == DurableDeliveryDecision.DROP:
+            return False
+        self._restore_claimed_command_and_abort(
+            channel_name,
+            envelope,
+            reason="durable command admission could not be verified",
+            error_type=WorkerAbortError,
+        )
+        return False
 
     def _active_channels(self, channel: str | Sequence[str]) -> tuple[str, ...]:
         channels = (channel,) if isinstance(channel, str) else tuple(channel)
@@ -148,25 +220,48 @@ class Listener:
         return None, None
 
     def _dispatch(self, channel_name: str, envelope: MessageEnvelope) -> object | None:
-        message = self.dispatcher.decode(envelope)
         handlers = self.dispatcher.registry.handlers_for(
-            message.message_kind,
-            message.message_type,
+            envelope.message_kind,
+            envelope.message_type,
         )
+        durable_identity = DurableCommandController.identity(envelope)
+        is_durable = durable_identity is not None
+        command_max_retries: int | None = None
+        if envelope.message_kind == CommandMessage.message_kind and is_durable:
+            if len(handlers) > 1:
+                self._restore_claimed_command_and_abort(
+                    channel_name,
+                    envelope,
+                    reason="durable commands require exactly one handler",
+                    error_type=WorkerAbortError,
+                )
+            command_max_retries = self.retry_policy.max_retries
+            if handlers:
+                command_spec = self._spec_for(handlers[0])
+                if command_spec.retry_limit is not None:
+                    command_max_retries = command_spec.retry_limit
+            if not self._admit_durable_delivery(
+                channel_name,
+                envelope,
+                max_retries=command_max_retries,
+            ):
+                return None
+
         if not handlers:
             raise HandlerNotFoundError(
-                f"No handlers registered for {message.message_kind}:{message.message_type}"
+                f"No handlers registered for {envelope.message_kind}:"
+                f"{envelope.message_type}"
             )
+
+        message = self.dispatcher.decode(envelope)
 
         if self._has_batched_handlers(handlers):
             self._buffer_batched_message(message.message_type, envelope)
             self._flush_ready_batches()
             return None
 
-        command_max_retries: int | None = None
-        if (
-            message.message_kind == CommandMessage.message_kind
-            and self._command_delivery_observers
+        if envelope.message_kind == CommandMessage.message_kind and (
+            self._command_delivery_observers or is_durable
         ):
             if len(handlers) != 1:
                 self._restore_claimed_command_and_abort(
@@ -175,12 +270,13 @@ class Listener:
                     reason="command delivery outcomes require exactly one handler",
                     error_type=WorkerAbortError,
                 )
-            command_spec = self._spec_for(handlers[0])
-            command_max_retries = (
-                self.retry_policy.max_retries
-                if command_spec.retry_limit is None
-                else command_spec.retry_limit
-            )
+            if command_max_retries is None:
+                command_spec = self._spec_for(handlers[0])
+                command_max_retries = (
+                    self.retry_policy.max_retries
+                    if command_spec.retry_limit is None
+                    else command_spec.retry_limit
+                )
             try:
                 self._notify_command_outcome(
                     envelope,
@@ -191,6 +287,13 @@ class Listener:
                     max_retries=command_max_retries,
                 )
             except DeliveryObservationError as exc:
+                if is_durable and self._durable_command_controller is not None:
+                    try:
+                        self._durable_command_controller.release(envelope)
+                    except Exception as release_exc:
+                        raise IndeterminateDeliveryError(
+                            "durable command admission could not be released"
+                        ) from release_exc
                 self._restore_claimed_command_and_abort(
                     channel_name,
                     envelope,
@@ -304,6 +407,14 @@ class Listener:
                 raise IndeterminateDeliveryError(
                     "continuation delay failed after message claim"
                 ) from exc
+        self._checkpoint_durable_settlement(
+            envelope,
+            status=CommandDeliveryStatus.CONTINUED,
+            source_queue=channel_name,
+            destination_queue=target_queue,
+            retry_count=self._retry_count(envelope),
+            max_retries=max_retries,
+        )
         self._settle_after_claim(
             "continuation",
             lambda: self.transport.publish(
@@ -459,6 +570,15 @@ class Listener:
         headers = dict(envelope.headers)
         headers["retries"] = retries + 1
         headers["last_attempt"] = now.isoformat()
+        self._checkpoint_durable_settlement(
+            envelope,
+            status=CommandDeliveryStatus.RETRY_SCHEDULED,
+            source_queue=channel_name,
+            destination_queue=channel_name,
+            retry_count=retries + 1,
+            max_retries=max_retries,
+            last_attempt_at=now,
+        )
         self._settle_after_claim(
             "retry requeue",
             lambda: self.transport.publish(
@@ -500,6 +620,14 @@ class Listener:
     ) -> None:
         headers = dict(envelope.headers)
         headers["dead_lettered_from"] = channel_name
+        self._checkpoint_durable_settlement(
+            envelope,
+            status=CommandDeliveryStatus.DEAD_LETTERED,
+            source_queue=channel_name,
+            destination_queue=self.dead_letter_channel,
+            retry_count=self._retry_count(envelope),
+            max_retries=max_retries,
+        )
         self._settle_after_claim(
             "dead-letter publication",
             lambda: self.transport.publish(
@@ -542,11 +670,14 @@ class Listener:
         retry_count: int,
         max_retries: int,
     ) -> None:
-        if (
-            envelope.message_kind != CommandMessage.message_kind
-            or not self._command_delivery_observers
-        ):
+        if envelope.message_kind != CommandMessage.message_kind:
             return
+        durable_record_id = envelope.headers.get("pybus_durable_record")
+        durable_generation = envelope.headers.get("pybus_durable_generation")
+        if durable_record_id is not None and not isinstance(durable_record_id, str):
+            durable_record_id = None
+        if durable_generation is not None and not isinstance(durable_generation, int):
+            durable_generation = None
         outcome = CommandDeliveryOutcome(
             status=status,
             message_id=envelope.message_id,
@@ -556,8 +687,18 @@ class Listener:
             destination_queue=destination_queue,
             retry_count=retry_count,
             max_retries=max_retries,
+            durable_record_id=durable_record_id,
+            durable_generation=durable_generation,
         )
         failures: list[Exception] = []
+        if self._durable_command_controller is not None:
+            try:
+                self._durable_command_controller.apply_outcome(outcome)
+            except Exception as exc:
+                failures.append(exc)
+                self._logger.exception(
+                    "Durable command outcome failed for %s", envelope.message_id
+                )
         for observer in self._command_delivery_observers:
             try:
                 observer(outcome)
@@ -570,6 +711,38 @@ class Listener:
             raise DeliveryObservationError(
                 "command delivery observer failed after a known message settlement"
             ) from failures[0]
+
+    def _checkpoint_durable_settlement(
+        self,
+        envelope: MessageEnvelope,
+        *,
+        status: CommandDeliveryStatus,
+        source_queue: str,
+        destination_queue: str | None,
+        retry_count: int,
+        max_retries: int,
+        last_attempt_at: datetime | None = None,
+    ) -> None:
+        if self._durable_command_controller is None:
+            return
+        try:
+            self._durable_command_controller.checkpoint(
+                envelope,
+                status=status,
+                source_queue=source_queue,
+                destination_queue=destination_queue,
+                retry_count=retry_count,
+                max_retries=max_retries,
+                last_attempt_at=last_attempt_at,
+            )
+        except Exception as exc:
+            self._restore_claimed_command_and_abort(
+                source_queue,
+                envelope,
+                reason="durable command settlement checkpoint failed",
+                error_type=WorkerAbortError,
+                cause=exc,
+            )
 
     def _restore_claimed_command_and_abort(
         self,

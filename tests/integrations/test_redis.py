@@ -15,6 +15,7 @@ from pybus import (
 )
 from pybus.bus import Pybus
 from pybus.dispatcher import Dispatcher
+from pybus.durable import DurableDeliveryDecision
 from pybus.envelope import MessageEnvelope
 from pybus.handlers import ContinueProcessing, batched_event_handler, event_handler
 from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
@@ -34,6 +35,7 @@ from pybus.listener import (
 )
 from pybus.messages import EventMessage
 from pybus.registry import Registry
+from pybus.retries import RetryPolicy
 from pybus.scheduling import configure_scheduler
 from pybus.worker import Worker
 
@@ -88,6 +90,24 @@ class FakeRedisClient:
         if self.set_error is not None:
             raise self.set_error
         self.values[key] = value.encode("utf-8")
+
+
+class PermissiveDurableStore:
+    def __init__(self) -> None:
+        self.settlements = []
+        self.outcomes = []
+
+    def admit_delivery(self, admission):
+        return DurableDeliveryDecision.PROCEED
+
+    def checkpoint_settlement(self, settlement):
+        self.settlements.append(settlement)
+
+    def apply_outcome(self, outcome, *, reconciliation_due_at):
+        self.outcomes.append(outcome)
+
+    def release_delivery(self, **kwargs):
+        return None
 
 
 def test_redis_schedule_state_store_round_trips_text() -> None:
@@ -244,6 +264,84 @@ def test_redis_preserves_prepared_identity_and_command_retry_outcomes() -> None:
     failed = MessageEnvelope.from_dict(bus.serializer.loads(failed_raw))
     assert failed.message_id == "job-redis-42"
     assert failed.headers["retries"] == bus.listener.retry_policy.max_retries
+
+
+def test_redis_durable_metadata_survives_retry_and_dead_letter_copies() -> None:
+    client = FakeRedisClient()
+
+    @command_handler(RedisGenerateBill)
+    def fail(command_message: RedisGenerateBill) -> None:
+        raise RuntimeError("billing unavailable")
+
+    bus = Pybus(
+        transport=RedisTransport(client=client),
+        handler_targets=[fail],
+        durable_command_store=PermissiveDurableStore(),
+    )
+    bus.listener.retry_policy = RetryPolicy(max_retries=1)
+    prepared = bus.prepare_command(
+        RedisGenerateBill(student_id=8), message_id="redis-durable-retry"
+    )
+    prepared.headers.update(
+        {
+            "pybus_durable_record": "record-retry",
+            "pybus_durable_generation": 3,
+        }
+    )
+    bus.publish_prepared(prepared)
+
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+    retry = MessageEnvelope.from_dict(
+        bus.serializer.loads(client.queues[DEFAULT_QUEUE_NAME][-1])
+    )
+    assert retry.headers["pybus_durable_record"] == "record-retry"
+    assert retry.headers["pybus_durable_generation"] == 3
+    assert retry.headers["retries"] == 1
+    assert "last_attempt" in retry.headers
+
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+    failed = MessageEnvelope.from_dict(
+        bus.serializer.loads(client.queues[DEFAULT_FAILED_QUEUE_NAME][-1])
+    )
+    assert failed.headers["pybus_durable_record"] == "record-retry"
+    assert failed.headers["pybus_durable_generation"] == 3
+    assert failed.headers["retries"] == 1
+    assert failed.headers["dead_lettered_from"] == DEFAULT_QUEUE_NAME
+
+
+def test_redis_durable_metadata_survives_continuation_copy() -> None:
+    client = FakeRedisClient()
+
+    @command_handler(RedisGenerateBill)
+    def continue_slowly(
+        command_message: RedisGenerateBill,
+    ) -> ContinueProcessing:
+        return ContinueProcessing(queue=DEFAULT_SLOW_QUEUE_NAME)
+
+    bus = Pybus(
+        transport=RedisTransport(client=client),
+        handler_targets=[continue_slowly],
+        durable_command_store=PermissiveDurableStore(),
+    )
+    prepared = bus.prepare_command(
+        RedisGenerateBill(student_id=9), message_id="redis-durable-continuation"
+    )
+    prepared.headers.update(
+        {
+            "pybus_durable_record": "record-continuation",
+            "pybus_durable_generation": 4,
+        }
+    )
+    bus.publish_prepared(prepared)
+
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+
+    continued = MessageEnvelope.from_dict(
+        bus.serializer.loads(client.queues[DEFAULT_SLOW_QUEUE_NAME][-1])
+    )
+    assert continued.message_id == "redis-durable-continuation"
+    assert continued.headers["pybus_durable_record"] == "record-continuation"
+    assert continued.headers["pybus_durable_generation"] == 4
 
 
 def test_redis_default_and_slow_workers_dispatch_distinct_queues() -> None:

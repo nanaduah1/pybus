@@ -19,6 +19,9 @@ def test_pybus_imports():
     assert pybus.configure_transport is not None
     assert pybus.publish_event is not None
     assert pybus.send_command is not None
+    assert pybus.schedule_command is not None
+    assert pybus.DurableCommandStore is not None
+    assert pybus.DurableCommandState is not None
     assert pybus.prepare_event is not None
     assert pybus.prepare_command is not None
     assert pybus.publish_prepared is not None

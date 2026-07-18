@@ -10,6 +10,7 @@ from pybus.bus import (
     publish_event,
     publish_prepared,
     request,
+    schedule_command,
     send_command,
 )
 from pybus.delivery import (
@@ -17,10 +18,18 @@ from pybus.delivery import (
     CommandDeliveryOutcome,
     CommandDeliveryStatus,
 )
+from pybus.durable import (
+    DurableCommandHandle,
+    DurableCommandPolicy,
+    DurableCommandState,
+    DurableCommandStore,
+)
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import (
     DeliveryObservationError,
+    DurableCommandConflictError,
+    DurableCommandsNotConfiguredError,
     IndeterminateDeliveryError,
     WorkerAbortError,
 )
@@ -111,6 +120,7 @@ __all__ = [
     "RequestMessage",
     "ResponseMessage",
     "request",
+    "schedule_command",
     "register_handlers",
     "request_handler",
     "configure_scheduler",
@@ -123,6 +133,12 @@ __all__ = [
     "declare_queue",
     "declare_queues",
     "send_command",
+    "DurableCommandHandle",
+    "DurableCommandPolicy",
+    "DurableCommandState",
+    "DurableCommandStore",
+    "DurableCommandConflictError",
+    "DurableCommandsNotConfiguredError",
     "Transport",
     "Worker",
     "WorkerAbortError",
