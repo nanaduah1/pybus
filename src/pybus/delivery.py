@@ -23,6 +23,8 @@ class CommandDeliveryOutcome:
     destination_queue: str | None
     retry_count: int
     max_retries: int
+    durable_record_id: str | None = None
+    durable_generation: int | None = None
 
 
 CommandDeliveryObserver = Callable[[CommandDeliveryOutcome], None]

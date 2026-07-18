@@ -123,7 +123,13 @@ def test_publication_copies_headers_and_requires_string_keys() -> None:
 
 @pytest.mark.parametrize(
     "reserved_header",
-    ["retries", "last_attempt", "dead_lettered_from"],
+    [
+        "retries",
+        "last_attempt",
+        "dead_lettered_from",
+        "pybus_durable_record",
+        "pybus_durable_generation",
+    ],
 )
 def test_publication_rejects_framework_delivery_headers(reserved_header: str) -> None:
     transport = MemoryTransport()

@@ -459,6 +459,46 @@ reconciliation by stable message ID rather than treating callbacks as a durable
 acknowledgement. Events, requests, responses, and batched delivery do not emit
 these outcomes in version one.
 
+### 4.2 Durable typed commands
+
+The opt-in durable path persists a typed command before publication:
+
+```python
+handle = pybus.schedule_command(command, idempotency_key=None)
+bus.create_durable_command_worker().run()
+```
+
+`send_command()` remains the immediate transport API. `schedule_command()` has
+no queue, header, or timing controls: routing is declared on the command and
+scheduling stores the canonical logical envelope without transport I/O.
+Without a configured `durable_command_store_factory` (or low-level
+`durable_command_store`), both durable APIs raise
+`DurableCommandsNotConfiguredError`.
+
+`DurableCommandPolicy` configures publisher-claim lease duration and the
+reconciliation delay used by publishers and consumers. It is set once on
+`BusConfiguration`; `create_durable_command_worker(policy=...)` may override it
+for one publisher. Until lease renewal exists, applications should size the
+reconciliation delay above their normal end-to-end command duration.
+
+The core store protocol and state types do not import Django. The first
+production implementation is the separate, opt-in
+`pybus.integrations.django_durable` app. It is atomic with application writes
+only when `DjangoDurableCommandStore(using=...)` uses the same database alias as
+the caller's transaction.
+
+Each claim increments a generation and publishes a copy carrying reserved
+`pybus_durable_record` and `pybus_durable_generation` headers. The listener
+checks that generation before handler dispatch, drops stale or terminal copies,
+and aborts fail-closed when current state cannot be verified. Retry,
+continuation, and dead-letter intent is checkpointed before transport
+publication. Terminal states do not regress, and unknown outcomes retain a
+conservative retry floor.
+
+This is an at-least-once contract across the database/transport boundary, not
+exactly-once execution. Handlers remain responsible for idempotent domain side
+effects.
+
 ---
 
 ## 5. Request / Response Contract

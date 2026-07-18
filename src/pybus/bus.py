@@ -3,14 +3,28 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import time
 from dataclasses import dataclass
+from threading import Event
 from typing import cast
 import unicodedata
 
 from pybus.codecs import PayloadCodec
 from pybus.delivery import CommandDeliveryObserver
+from pybus.durable import (
+    DurableCommandDraft,
+    DurableCommandController,
+    DurableCommandHandle,
+    DurableCommandPoller,
+    DurableCommandPolicy,
+    DurableCommandRunner,
+    DurableCommandStore,
+)
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
-from pybus.exceptions import InvalidMessageDefinitionError, MessageTimeoutError
+from pybus.exceptions import (
+    DurableCommandsNotConfiguredError,
+    InvalidMessageDefinitionError,
+    MessageTimeoutError,
+)
 from pybus.listener import Listener
 from pybus.messages import (
     BaseMessage,
@@ -33,7 +47,13 @@ from pybus.worker import Worker, WorkerHook
 
 MAX_MESSAGE_ID_LENGTH = 255
 FRAMEWORK_DELIVERY_HEADERS = frozenset(
-    {"dead_lettered_from", "last_attempt", "retries"}
+    {
+        "dead_lettered_from",
+        "last_attempt",
+        "pybus_durable_generation",
+        "pybus_durable_record",
+        "retries",
+    }
 )
 
 
@@ -84,6 +104,8 @@ class Pybus:
     payload_codec: PayloadCodec
     worker_hook_factories: tuple[Callable[[], WorkerHook], ...]
     command_delivery_observers: tuple[CommandDeliveryObserver, ...]
+    durable_command_store: DurableCommandStore | None
+    durable_command_policy: DurableCommandPolicy
 
     def __init__(
         self,
@@ -96,6 +118,8 @@ class Pybus:
         payload_codec: PayloadCodec | None = None,
         worker_hook_factories: Sequence[Callable[[], WorkerHook]] = (),
         command_delivery_observers: Sequence[CommandDeliveryObserver] = (),
+        durable_command_store: DurableCommandStore | None = None,
+        durable_command_policy: DurableCommandPolicy | None = None,
     ) -> None:
         self.transport = transport
         if dispatcher is not None and payload_codec is not None:
@@ -106,6 +130,8 @@ class Pybus:
         self.payload_codec = self.dispatcher.payload_codec
         self.serializer = serializer or JsonSerializer()
         self.topology = topology or QueueTopology()
+        self.durable_command_store = durable_command_store
+        self.durable_command_policy = durable_command_policy or DurableCommandPolicy()
         self.listener = Listener(
             transport=transport,
             dispatcher=self.dispatcher,
@@ -113,6 +139,13 @@ class Pybus:
             dead_letter_channel=self.topology.dead_letter_queue,
             topology=self.topology,
             command_delivery_observers=command_delivery_observers,
+            durable_command_controller=(
+                None
+                if durable_command_store is None
+                else DurableCommandController(
+                    durable_command_store, self.durable_command_policy
+                )
+            ),
         )
         self.coordinator = RequestResponseCoordinator()
         self.reply_queue = default_reply_queue_name()
@@ -157,6 +190,92 @@ class Pybus:
             queue=queue,
             message_id=message_id,
             headers=headers,
+        )
+
+    def schedule_command(
+        self, command: object, *, idempotency_key: str | None = None
+    ) -> DurableCommandHandle:
+        if self.durable_command_store is None:
+            raise DurableCommandsNotConfiguredError(
+                "durable commands require a durable_command_store"
+            )
+        if not is_typed_message_class(type(command)):
+            raise InvalidMessageDefinitionError(
+                "schedule_command requires an @command typed command"
+            )
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key) > 255
+        ):
+            raise InvalidMessageDefinitionError(
+                "idempotency_key must be a non-empty string of at most 255 characters"
+            )
+        envelope = self.prepare_command(command)
+        queue = self._resolve_publication_queue(command, None)
+        fingerprint = self.serializer.dumps(
+            {
+                "message_type": envelope.message_type,
+                "version": envelope.version,
+                "payload": envelope.payload,
+                "headers": envelope.headers,
+                "queue": queue,
+            }
+        )
+        record = self.durable_command_store.schedule(
+            DurableCommandDraft(
+                message_id=envelope.message_id,
+                message_type=envelope.message_type,
+                version=envelope.version,
+                payload=envelope.payload,
+                headers=dict(envelope.headers),
+                created_at=envelope.created_at,
+                available_at=envelope.created_at,
+                queue=queue,
+                fingerprint=fingerprint,
+                idempotency_key=idempotency_key,
+            )
+        )
+        return DurableCommandHandle.from_record(record)
+
+    def create_durable_command_worker(
+        self,
+        *,
+        hooks: Sequence[WorkerHook] | None = None,
+        error_delay: float = 1.0,
+        logger=None,
+        stop_event=None,
+        policy: DurableCommandPolicy | None = None,
+        idle_delay: float = 1.0,
+    ) -> Worker:
+        if self.durable_command_store is None:
+            raise DurableCommandsNotConfiguredError(
+                "durable commands require a durable_command_store"
+            )
+        resolved_hooks = (
+            tuple(factory() for factory in self.worker_hook_factories)
+            if hooks is None
+            else tuple(hooks)
+        )
+        if any(not isinstance(hook, WorkerHook) for hook in resolved_hooks):
+            raise TypeError("worker hook factories must return WorkerHook instances")
+        resolved_stop_event = Event() if stop_event is None else stop_event
+        poller = DurableCommandPoller(
+            DurableCommandRunner(
+                self.durable_command_store,
+                lambda envelope, queue: self.publish_prepared(envelope, queue=queue),
+                policy=policy or self.durable_command_policy,
+            ),
+            idle_delay=idle_delay,
+            stop_event=resolved_stop_event,
+        )
+        return Worker(
+            poller,
+            "__pybus_durable_commands__",
+            hooks=resolved_hooks,
+            error_delay=error_delay,
+            logger=logger,
+            stop_event=resolved_stop_event,
         )
 
     def prepare_event(
@@ -488,6 +607,12 @@ def send_command(
     return get_bus().send_command(
         command, queue=queue, message_id=message_id, headers=headers
     )
+
+
+def schedule_command(
+    command: object, *, idempotency_key: str | None = None
+) -> DurableCommandHandle:
+    return get_bus().schedule_command(command, idempotency_key=idempotency_key)
 
 
 def prepare_event(

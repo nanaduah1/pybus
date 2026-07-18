@@ -41,5 +41,13 @@ class DeliveryObservationError(WorkerAbortError):
     """Raised when delivery observers fail before or after a known settlement."""
 
 
+class DurableCommandsNotConfiguredError(PybusError):
+    """Raised when durable command APIs are used without a durable store."""
+
+
+class DurableCommandConflictError(PybusError):
+    """Raised when an idempotency key identifies a different command."""
+
+
 class InvalidMessageDefinitionError(ValueError, PybusError):
     """Raised when a message or envelope definition is invalid."""

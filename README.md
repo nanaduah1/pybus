@@ -103,6 +103,63 @@ versions have the same inputs; `publish_prepared` defers the already-created
 envelope until commit, so rollback publishes nothing and retrying from stored
 JSON preserves its identity.
 
+## Durable typed commands
+
+Use the opt-in Django durable-command app when a one-off typed command must be
+committed before any transport publication:
+
+```python
+# settings.py
+INSTALLED_APPS += ["pybus.integrations.django_durable"]
+```
+
+Run the normal Django migrations, then configure the store on the same database
+alias as the transaction that schedules work:
+
+```python
+from pybus import BusConfiguration
+from pybus.integrations.django_durable.store import DjangoDurableCommandStore
+
+APPLICATION_BUS = BusConfiguration(
+    transport_factory=create_transport,
+    durable_command_store_factory=lambda: DjangoDurableCommandStore(
+        using="default"
+    ),
+)
+bus = APPLICATION_BUS.configure()
+```
+
+Ordinary callers only schedule the domain command. Routing still comes from the
+command declaration and configured topology; scheduling performs no transport
+I/O and participates in the caller's database transaction:
+
+```python
+handle = pybus.schedule_command(GenerateBill(student_id=7))
+```
+
+Pass an `idempotency_key` only when intentional schedule deduplication is
+required.
+
+Run a durable publisher separately from the ordinary command consumer:
+
+```python
+bus.create_durable_command_worker().run()  # claims and publishes
+bus.create_worker().run()                  # invokes typed handlers
+```
+
+The contract is at-least-once. Generation fencing prevents stale transport
+copies from invoking handlers, but handlers must still be idempotent or protect
+domain side effects with an inbox/domain guard. An idempotency key identifies
+one canonical command; reusing it for different content raises
+`DurableCommandConflictError`. To disable the feature, stop its publisher and
+remove its store configuration while retaining the table for recovery.
+
+`DurableCommandPolicy` configures publisher-claim leases and the delay before a
+missing publication or handler outcome becomes eligible for reconciliation.
+Size the reconciliation delay above normal end-to-end command duration until a
+later release adds lease renewal. Configure it on `BusConfiguration`, or pass a
+one-worker override to `create_durable_command_worker(policy=...)`.
+
 ## Reusable application composition
 
 Declare transport, topology, handlers, and integration hooks once. The same
