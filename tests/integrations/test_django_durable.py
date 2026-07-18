@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from importlib import import_module
+import json
 from pathlib import Path
 import subprocess
 import sys
 import textwrap
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
@@ -54,12 +56,22 @@ from pybus.integrations.django_durable.store import DjangoDurableCommandStore
 from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME
 from pybus.queues import DEFAULT_SLOW_QUEUE_NAME
 from pybus.retries import RetryPolicy
+from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
 
 
 @command("reports.build")
 class BuildReport:
     report_id: int
+
+
+@command("reports.build_with_supported_values")
+class BuildReportWithSupportedValues:
+    occurred_at: datetime
+    occurred_on: date
+    local_time: time
+    reference_id: UUID
+    nested: dict[str, object]
 
 
 class FailOnPublication(MemoryTransport):
@@ -168,6 +180,47 @@ def test_django_store_runs_the_command_to_an_irreversible_terminal_state() -> No
     assert handled == [BuildReport(report_id=3)]
     assert record.state == DurableCommandState.SUCCEEDED
     assert record.generation == 1
+
+
+def test_durable_command_admits_supported_codec_values_end_to_end() -> None:
+    handled = []
+
+    @command_handler(BuildReportWithSupportedValues)
+    def handle(message: BuildReportWithSupportedValues) -> None:
+        handled.append(message)
+
+    occurred_at = datetime(2026, 7, 18, 14, 30, tzinfo=timezone.utc)
+    occurred_on = date(2026, 7, 18)
+    local_time = time(14, 30, tzinfo=timezone.utc)
+    reference_id = UUID("2e75d610-8f16-4a89-a875-c34353ad411d")
+    command = BuildReportWithSupportedValues(
+        occurred_at=occurred_at,
+        occurred_on=occurred_on,
+        local_time=local_time,
+        reference_id=reference_id,
+        nested={
+            "occurred_at": occurred_at,
+            "occurred_on": occurred_on,
+            "local_time": local_time,
+            "reference_id": reference_id,
+        },
+    )
+    transport = MemoryTransport()
+    bus = Pybus(
+        transport,
+        durable_command_store=DjangoDurableCommandStore(),
+        handler_targets=[handle],
+    )
+    handle_ref = bus.schedule_command(command)
+
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert handled == [command]
+    assert (
+        DurableCommand.objects.get(id=handle_ref.id).state
+        == DurableCommandState.SUCCEEDED
+    )
 
 
 def test_late_mark_published_cannot_regress_a_fast_successful_handler() -> None:
@@ -509,6 +562,107 @@ def test_admission_rejects_tampered_logical_command(change) -> None:
     )
 
     assert store.admit_delivery(replace(admission, **change)).value == "abort"
+
+
+@pytest.mark.parametrize(
+    "supported_value",
+    [
+        datetime(2026, 7, 18, 15, 45, tzinfo=timezone.utc),
+        date(2026, 7, 18),
+        time(15, 45, tzinfo=timezone.utc),
+        UUID("7387d9ce-1de7-4e4a-81b5-54c6d02c2630"),
+    ],
+)
+def test_admission_canonicalizes_supported_application_header_values(
+    supported_value,
+) -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    handle_ref = bus.schedule_command(BuildReport(report_id=111))
+    DurableCommand.objects.filter(id=handle_ref.id).update(
+        headers=json.loads(JsonSerializer().dumps({"value": supported_value}))
+    )
+    now = django.utils.timezone.now()
+    claim = store.claim(
+        worker_id="publisher",
+        now=now,
+        lease_expires_at=now + timedelta(seconds=30),
+    )
+    assert claim is not None
+    delivered_headers = JsonSerializer().loads(JsonSerializer().dumps(claim.headers))
+    admission = DurableDeliveryAdmission(
+        record_id=claim.id,
+        generation=claim.generation,
+        source_queue=claim.queue,
+        retry_count=claim.retry_count,
+        max_retries=10,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        payload=claim.payload,
+        application_headers=delivered_headers,
+    )
+
+    assert store.admit_delivery(admission).value == "proceed"
+
+
+def test_admission_rejects_a_modified_supported_codec_value() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    handle_ref = bus.schedule_command(BuildReport(report_id=113))
+    stored_value = datetime(2026, 7, 18, 15, 45, tzinfo=timezone.utc)
+    DurableCommand.objects.filter(id=handle_ref.id).update(
+        headers=json.loads(JsonSerializer().dumps({"value": stored_value}))
+    )
+    now = django.utils.timezone.now()
+    claim = store.claim(
+        worker_id="publisher",
+        now=now,
+        lease_expires_at=now + timedelta(seconds=30),
+    )
+    assert claim is not None
+    admission = DurableDeliveryAdmission(
+        record_id=claim.id,
+        generation=claim.generation,
+        source_queue=claim.queue,
+        retry_count=claim.retry_count,
+        max_retries=10,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        payload=claim.payload,
+        application_headers={"value": stored_value + timedelta(seconds=1)},
+    )
+
+    assert store.admit_delivery(admission).value == "abort"
+
+
+def test_admission_distinguishes_json_booleans_from_integers() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    handle_ref = bus.schedule_command(BuildReport(report_id=112))
+    DurableCommand.objects.filter(id=handle_ref.id).update(headers={"enabled": True})
+    now = django.utils.timezone.now()
+    claim = store.claim(
+        worker_id="publisher",
+        now=now,
+        lease_expires_at=now + timedelta(seconds=30),
+    )
+    assert claim is not None
+    admission = DurableDeliveryAdmission(
+        record_id=claim.id,
+        generation=claim.generation,
+        source_queue=claim.queue,
+        retry_count=claim.retry_count,
+        max_retries=10,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        payload=claim.payload,
+        application_headers={"enabled": 1},
+    )
+
+    assert store.admit_delivery(admission).value == "abort"
 
 
 def test_enqueue_then_lost_ack_is_admitted_without_waiting_for_reconciliation() -> None:

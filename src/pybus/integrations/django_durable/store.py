@@ -17,8 +17,13 @@ from pybus.durable import (
     DurableDeliveryDecision,
     DurableSettlement,
 )
-from pybus.exceptions import DurableCommandConflictError, WorkerAbortError
+from pybus.exceptions import (
+    DurableCommandConflictError,
+    SerializationError,
+    WorkerAbortError,
+)
 from pybus.integrations.django_durable.models import DurableCommand
+from pybus.serializer import JsonSerializer
 
 
 class DjangoDurableCommandStore:
@@ -248,12 +253,20 @@ class DjangoDurableCommandStore:
                 and model.indeterminate_reason != "publication_acknowledgement"
             ):
                 return DurableDeliveryDecision.DROP
+            serializer = JsonSerializer()
+            try:
+                stored_payload = serializer.dumps(model.payload)
+                admitted_payload = serializer.dumps(admission.payload)
+                stored_headers = serializer.dumps(model.headers)
+                admitted_headers = serializer.dumps(admission.application_headers)
+            except SerializationError:
+                return DurableDeliveryDecision.ABORT
             if (
                 model.message_id != admission.message_id
                 or model.message_type != admission.message_type
                 or model.version != admission.version
-                or model.payload != admission.payload
-                or model.headers != admission.application_headers
+                or stored_payload != admitted_payload
+                or stored_headers != admitted_headers
                 or model.queue != admission.source_queue
                 or model.last_attempt_at != admission.last_attempt_at
             ):
