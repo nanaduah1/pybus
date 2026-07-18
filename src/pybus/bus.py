@@ -11,19 +11,19 @@ import unicodedata
 from pybus.codecs import PayloadCodec
 from pybus.delivery import CommandDeliveryObserver
 from pybus.durable import (
-    DurableCommandDraft,
-    DurableCommandController,
-    DurableCommandHandle,
-    DurableCommandPoller,
-    DurableCommandPolicy,
-    DurableCommandRunner,
-    DurableCommandStore,
+    DurableJobDraft,
+    DurableJobController,
+    DurableJobHandle,
+    DurableJobPoller,
+    DurableJobPolicy,
+    DurableJobRunner,
+    DurableJobStore,
 )
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import (
-    DurableCommandsNotConfiguredError,
-    DurableRecurrenceNotSupportedError,
+    DurableJobsNotConfiguredError,
+    JobSeriesNotSupportedError,
     InvalidMessageDefinitionError,
     MessageTimeoutError,
 )
@@ -45,9 +45,9 @@ from pybus.request_response import (
 )
 from pybus.recurrence import (
     Recurrence,
-    RecurringCommandSeriesDraft,
-    RecurringCommandSeriesHandle,
-    RecurringCommandStore,
+    JobSeriesDraft,
+    JobSeriesHandle,
+    JobSeriesStore,
 )
 from pybus.serializer import JsonSerializer
 from pybus.worker import Worker, WorkerHook
@@ -63,6 +63,13 @@ FRAMEWORK_DELIVERY_HEADERS = frozenset(
         "retries",
     }
 )
+
+
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
 
 
 def _validate_message_id(message_id: object | None) -> str | None:
@@ -112,8 +119,8 @@ class Pybus:
     payload_codec: PayloadCodec
     worker_hook_factories: tuple[Callable[[], WorkerHook], ...]
     command_delivery_observers: tuple[CommandDeliveryObserver, ...]
-    durable_command_store: DurableCommandStore | None
-    durable_command_policy: DurableCommandPolicy
+    _durable_job_store: DurableJobStore | None
+    _durable_job_policy: DurableJobPolicy
 
     def __init__(
         self,
@@ -126,9 +133,37 @@ class Pybus:
         payload_codec: PayloadCodec | None = None,
         worker_hook_factories: Sequence[Callable[[], WorkerHook]] = (),
         command_delivery_observers: Sequence[CommandDeliveryObserver] = (),
-        durable_command_store: DurableCommandStore | None = None,
-        durable_command_policy: DurableCommandPolicy | None = None,
+        durable_job_store: DurableJobStore | None | _Unset = _UNSET,
+        durable_job_policy: DurableJobPolicy | None | _Unset = _UNSET,
+        durable_command_store: DurableJobStore | None | _Unset = _UNSET,
+        durable_command_policy: DurableJobPolicy | None | _Unset = _UNSET,
     ) -> None:
+        if durable_job_store is not _UNSET and durable_command_store is not _UNSET:
+            raise TypeError(
+                "durable_job_store and durable_command_store cannot both be supplied"
+            )
+        if durable_job_policy is not _UNSET and durable_command_policy is not _UNSET:
+            raise TypeError(
+                "durable_job_policy and durable_command_policy cannot both be supplied"
+            )
+        resolved_store = (
+            durable_job_store
+            if durable_job_store is not _UNSET
+            else durable_command_store
+            if durable_command_store is not _UNSET
+            else None
+        )
+        resolved_policy = (
+            durable_job_policy
+            if durable_job_policy is not _UNSET
+            else durable_command_policy
+            if durable_command_policy is not _UNSET
+            else None
+        )
+        if resolved_policy is not None and not isinstance(
+            resolved_policy, DurableJobPolicy
+        ):
+            raise TypeError("durable_job_policy must be a DurableJobPolicy")
         self.transport = transport
         if dispatcher is not None and payload_codec is not None:
             raise ValueError(
@@ -138,8 +173,8 @@ class Pybus:
         self.payload_codec = self.dispatcher.payload_codec
         self.serializer = serializer or JsonSerializer()
         self.topology = topology or QueueTopology()
-        self.durable_command_store = durable_command_store
-        self.durable_command_policy = durable_command_policy or DurableCommandPolicy()
+        self._durable_job_store = resolved_store
+        self._durable_job_policy = resolved_policy or DurableJobPolicy()
         self.listener = Listener(
             transport=transport,
             dispatcher=self.dispatcher,
@@ -147,12 +182,10 @@ class Pybus:
             dead_letter_channel=self.topology.dead_letter_queue,
             topology=self.topology,
             command_delivery_observers=command_delivery_observers,
-            durable_command_controller=(
+            durable_job_controller=(
                 None
-                if durable_command_store is None
-                else DurableCommandController(
-                    durable_command_store, self.durable_command_policy
-                )
+                if resolved_store is None
+                else DurableJobController(resolved_store, self.durable_job_policy)
             ),
         )
         self.coordinator = RequestResponseCoordinator()
@@ -167,6 +200,57 @@ class Pybus:
             from pybus.handlers import register_handlers
 
             register_handlers(*handler_targets, registry=self.dispatcher.registry)
+
+    @property
+    def durable_job_store(self) -> DurableJobStore | None:
+        return self._durable_job_store
+
+    @durable_job_store.setter
+    def durable_job_store(self, value: DurableJobStore | None) -> None:
+        self._durable_job_store = value
+        self._refresh_durable_job_controller()
+
+    @property
+    def durable_job_policy(self) -> DurableJobPolicy:
+        return self._durable_job_policy
+
+    @durable_job_policy.setter
+    def durable_job_policy(self, value: DurableJobPolicy) -> None:
+        if not isinstance(value, DurableJobPolicy):
+            raise TypeError("durable_job_policy must be a DurableJobPolicy")
+        self._durable_job_policy = value
+        self._refresh_durable_job_controller()
+
+    @property
+    def durable_command_store(self) -> DurableJobStore | None:
+        """Compatibility alias for :attr:`durable_job_store`."""
+
+        return self.durable_job_store
+
+    @durable_command_store.setter
+    def durable_command_store(self, value: DurableJobStore | None) -> None:
+        self.durable_job_store = value
+
+    @property
+    def durable_command_policy(self) -> DurableJobPolicy:
+        """Compatibility alias for :attr:`durable_job_policy`."""
+
+        return self.durable_job_policy
+
+    @durable_command_policy.setter
+    def durable_command_policy(self, value: DurableJobPolicy) -> None:
+        self.durable_job_policy = value
+
+    def _refresh_durable_job_controller(self) -> None:
+        if not hasattr(self, "listener"):
+            return
+        controller = (
+            None
+            if self._durable_job_store is None
+            else DurableJobController(self._durable_job_store, self._durable_job_policy)
+        )
+        self.listener._durable_job_controller = controller
+        self.listener._durable_command_controller = controller
 
     def publish_event(
         self,
@@ -207,10 +291,10 @@ class Pybus:
         run_at: datetime | None = None,
         recurrence: Recurrence | None = None,
         idempotency_key: str | None = None,
-    ) -> DurableCommandHandle:
-        if self.durable_command_store is None:
-            raise DurableCommandsNotConfiguredError(
-                "durable commands require a durable_command_store"
+    ) -> DurableJobHandle:
+        if self.durable_job_store is None:
+            raise DurableJobsNotConfiguredError(
+                "durable jobs require a durable_job_store"
             )
         if not is_typed_message_class(type(command)):
             raise InvalidMessageDefinitionError(
@@ -264,7 +348,7 @@ class Pybus:
                 "run_at": (None if run_at is None else normalized_run_at.isoformat()),
             }
         fingerprint = self.serializer.dumps(fingerprint_fields)
-        draft = DurableCommandDraft(
+        draft = DurableJobDraft(
             message_id=envelope.message_id,
             message_type=envelope.message_type,
             version=envelope.version,
@@ -277,12 +361,12 @@ class Pybus:
             idempotency_key=idempotency_key,
         )
         if recurrence is not None:
-            if not isinstance(self.durable_command_store, RecurringCommandStore):
-                raise DurableRecurrenceNotSupportedError(
+            if not isinstance(self.durable_job_store, JobSeriesStore):
+                raise JobSeriesNotSupportedError(
                     "configured durable store does not support recurrence"
                 )
-            _, record = self.durable_command_store.schedule_recurring(
-                RecurringCommandSeriesDraft(
+            _, record = self.durable_job_store.schedule_recurring(
+                JobSeriesDraft(
                     first_occurrence=draft,
                     recurrence=recurrence,
                     starts_at=normalized_run_at,
@@ -291,39 +375,39 @@ class Pybus:
                 )
             )
         else:
-            record = self.durable_command_store.schedule(draft)
-        return DurableCommandHandle.from_record(record)
+            record = self.durable_job_store.schedule(draft)
+        return DurableJobHandle.from_record(record)
 
-    def cancel_recurring_command(self, series_id: str) -> RecurringCommandSeriesHandle:
-        if self.durable_command_store is None:
-            raise DurableCommandsNotConfiguredError(
-                "durable commands require a durable_command_store"
+    def cancel_recurring_command(self, series_id: str) -> JobSeriesHandle:
+        if self.durable_job_store is None:
+            raise DurableJobsNotConfiguredError(
+                "durable jobs require a durable_job_store"
             )
-        if not isinstance(self.durable_command_store, RecurringCommandStore):
-            raise DurableRecurrenceNotSupportedError(
+        if not isinstance(self.durable_job_store, JobSeriesStore):
+            raise JobSeriesNotSupportedError(
                 "configured durable store does not support recurrence"
             )
         if not isinstance(series_id, str) or not series_id.strip():
             raise InvalidMessageDefinitionError("series_id must be a non-empty string")
-        record = self.durable_command_store.cancel_recurring(
+        record = self.durable_job_store.cancel_recurring(
             series_id=series_id,
             cancelled_at=datetime.now(timezone.utc),
         )
-        return RecurringCommandSeriesHandle.from_record(record)
+        return JobSeriesHandle.from_record(record)
 
-    def create_durable_command_worker(
+    def create_durable_job_worker(
         self,
         *,
         hooks: Sequence[WorkerHook] | None = None,
         error_delay: float = 1.0,
         logger=None,
         stop_event=None,
-        policy: DurableCommandPolicy | None = None,
+        policy: DurableJobPolicy | None = None,
         idle_delay: float = 1.0,
     ) -> Worker:
-        if self.durable_command_store is None:
-            raise DurableCommandsNotConfiguredError(
-                "durable commands require a durable_command_store"
+        if self.durable_job_store is None:
+            raise DurableJobsNotConfiguredError(
+                "durable jobs require a durable_job_store"
             )
         resolved_hooks = (
             tuple(factory() for factory in self.worker_hook_factories)
@@ -333,11 +417,11 @@ class Pybus:
         if any(not isinstance(hook, WorkerHook) for hook in resolved_hooks):
             raise TypeError("worker hook factories must return WorkerHook instances")
         resolved_stop_event = Event() if stop_event is None else stop_event
-        poller = DurableCommandPoller(
-            DurableCommandRunner(
-                self.durable_command_store,
+        poller = DurableJobPoller(
+            DurableJobRunner(
+                self.durable_job_store,
                 lambda envelope, queue: self.publish_prepared(envelope, queue=queue),
-                policy=policy or self.durable_command_policy,
+                policy=policy or self.durable_job_policy,
             ),
             idle_delay=idle_delay,
             stop_event=resolved_stop_event,
@@ -620,6 +704,9 @@ class Pybus:
             self.coordinator.store_response(envelope)
 
 
+Pybus.create_durable_command_worker = Pybus.create_durable_job_worker
+
+
 _default_bus: Pybus | None = None
 
 
@@ -688,7 +775,7 @@ def schedule_command(
     run_at: datetime | None = None,
     recurrence: Recurrence | None = None,
     idempotency_key: str | None = None,
-) -> DurableCommandHandle:
+) -> DurableJobHandle:
     return get_bus().schedule_command(
         command,
         run_at=run_at,
@@ -697,7 +784,7 @@ def schedule_command(
     )
 
 
-def cancel_recurring_command(series_id: str) -> RecurringCommandSeriesHandle:
+def cancel_recurring_command(series_id: str) -> JobSeriesHandle:
     return get_bus().cancel_recurring_command(series_id)
 
 

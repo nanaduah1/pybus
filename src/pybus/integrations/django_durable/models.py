@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from django.db import models
 
-from pybus.durable import DurableCommandState
-from pybus.recurrence import RecurringCommandSeriesState
+from pybus.durable import DurableJobState
+from pybus.recurrence import JobSeriesState
 
 
-class RecurringCommandSeries(models.Model):
+class JobSeries(models.Model):
     id = models.UUIDField(primary_key=True, editable=False)
     message_type = models.CharField(max_length=255)
     version = models.PositiveIntegerField()
@@ -22,7 +22,7 @@ class RecurringCommandSeries(models.Model):
     idempotency_key = models.CharField(max_length=255, null=True, unique=True)
     state = models.CharField(
         max_length=32,
-        default=RecurringCommandSeriesState.ACTIVE.value,
+        default=JobSeriesState.ACTIVE.value,
     )
     latest_occurrence_number = models.PositiveBigIntegerField(default=1)
     created_at = models.DateTimeField()
@@ -34,7 +34,7 @@ class RecurringCommandSeries(models.Model):
         db_table = "pybus_recurring_command_series"
 
 
-class DurableCommand(models.Model):
+class DurableJob(models.Model):
     id = models.UUIDField(primary_key=True, editable=False)
     message_id = models.CharField(max_length=255, unique=True)
     message_type = models.CharField(max_length=255)
@@ -47,13 +47,13 @@ class DurableCommand(models.Model):
     fingerprint = models.TextField()
     idempotency_key = models.CharField(max_length=255, null=True, unique=True)
     series = models.ForeignKey(
-        RecurringCommandSeries,
+        JobSeries,
         null=True,
         on_delete=models.PROTECT,
         related_name="occurrences",
     )
     occurrence_number = models.PositiveBigIntegerField(null=True)
-    state = models.CharField(max_length=32, default=DurableCommandState.PENDING.value)
+    state = models.CharField(max_length=32, default=DurableJobState.PENDING.value)
     generation = models.PositiveBigIntegerField(default=0)
     retry_count = models.PositiveIntegerField(default=0)
     max_retries = models.PositiveIntegerField(null=True)
@@ -91,14 +91,20 @@ class DurableCommand(models.Model):
                 fields=["series"],
                 condition=models.Q(
                     state__in=[
-                        DurableCommandState.PENDING.value,
-                        DurableCommandState.CLAIMED.value,
-                        DurableCommandState.PUBLISHED.value,
-                        DurableCommandState.RUNNING.value,
-                        DurableCommandState.SETTLING.value,
-                        DurableCommandState.INDETERMINATE.value,
+                        DurableJobState.PENDING.value,
+                        DurableJobState.CLAIMED.value,
+                        DurableJobState.PUBLISHED.value,
+                        DurableJobState.RUNNING.value,
+                        DurableJobState.SETTLING.value,
+                        DurableJobState.INDETERMINATE.value,
                     ]
                 ),
                 name="pybus_series_active_occurrence_uniq",
             ),
         ]
+
+
+DurableCommand = DurableJob
+RecurringCommandSeries = JobSeries
+
+__all__ = ["DurableCommand", "DurableJob", "JobSeries", "RecurringCommandSeries"]

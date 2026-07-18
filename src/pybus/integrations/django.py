@@ -51,7 +51,7 @@ class DjangoConnectionCleanupHook(WorkerHook):
         self._close_connections()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class BusConfiguration(CoreBusConfiguration):
     """Django composition with connection cleanup enabled by default."""
 

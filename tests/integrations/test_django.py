@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from inspect import signature
 from unittest.mock import Mock, patch
 
@@ -9,6 +9,7 @@ import pybus.bus as bus_module
 
 from pybus import (
     BusConfiguration as CoreBusConfiguration,
+    DurableJobPolicy,
     Pybus,
     command,
     event,
@@ -149,6 +150,21 @@ def test_django_bus_configuration_has_the_core_constructor_contract() -> None:
         signature(BusConfiguration).parameters
         == signature(CoreBusConfiguration).parameters
     )
+
+
+def test_django_bus_configuration_replace_accepts_legacy_job_names() -> None:
+    store = object()
+    policy = DurableJobPolicy()
+    configuration = BusConfiguration(transport_factory=MemoryTransport)
+
+    updated = replace(
+        configuration,
+        durable_command_store_factory=lambda: store,
+        durable_command_policy=policy,
+    )
+
+    assert updated.durable_job_store_factory() is store
+    assert updated.durable_job_policy is policy
 
 
 def test_django_bus_configuration_adds_fresh_cleanup_hooks_by_default(

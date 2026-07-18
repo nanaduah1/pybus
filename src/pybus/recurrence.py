@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:
     from pybus.delivery import CommandDeliveryOutcome
-    from pybus.durable import DurableCommandDraft, DurableCommandRecord
+    from pybus.durable import DurableJobDraft, DurableJobRecord
 
 
 class RecurrenceCadence(StrEnum):
@@ -18,7 +18,7 @@ class RecurrenceCadence(StrEnum):
     MONTHLY = "monthly"
 
 
-class RecurringCommandSeriesState(StrEnum):
+class JobSeriesState(StrEnum):
     ACTIVE = "active"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -53,8 +53,8 @@ class EndRecurrence:
 
 
 @dataclass(frozen=True, slots=True)
-class RecurringCommandSeriesDraft:
-    first_occurrence: DurableCommandDraft
+class JobSeriesDraft:
+    first_occurrence: DurableJobDraft
     recurrence: Recurrence
     starts_at: datetime
     fingerprint: str
@@ -62,9 +62,9 @@ class RecurringCommandSeriesDraft:
 
 
 @dataclass(frozen=True, slots=True)
-class RecurringCommandSeriesRecord:
+class JobSeriesRecord:
     id: str
-    state: RecurringCommandSeriesState
+    state: JobSeriesState
     cadence: RecurrenceCadence
     timezone: str
     starts_at: datetime
@@ -80,9 +80,9 @@ class RecurringCommandSeriesRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class RecurringCommandSeriesHandle:
+class JobSeriesHandle:
     id: str
-    state: RecurringCommandSeriesState
+    state: JobSeriesState
     occurrence_id: str
     message_id: str
     occurrence_number: int
@@ -90,9 +90,7 @@ class RecurringCommandSeriesHandle:
     created_at: datetime
 
     @classmethod
-    def from_record(
-        cls, record: RecurringCommandSeriesRecord
-    ) -> RecurringCommandSeriesHandle:
+    def from_record(cls, record: JobSeriesRecord) -> JobSeriesHandle:
         return cls(
             id=record.id,
             state=record.state,
@@ -105,14 +103,14 @@ class RecurringCommandSeriesHandle:
 
 
 @runtime_checkable
-class RecurringCommandStore(Protocol):
+class JobSeriesStore(Protocol):
     def schedule_recurring(
-        self, draft: RecurringCommandSeriesDraft
-    ) -> tuple[RecurringCommandSeriesRecord, DurableCommandRecord]: ...
+        self, draft: JobSeriesDraft
+    ) -> tuple[JobSeriesRecord, DurableJobRecord]: ...
 
     def cancel_recurring(
         self, *, series_id: str, cancelled_at: datetime
-    ) -> RecurringCommandSeriesRecord: ...
+    ) -> JobSeriesRecord: ...
 
     def complete_recurring_success(
         self,
@@ -220,10 +218,22 @@ def _require_aware(value: datetime, *, label: str) -> None:
         raise ValueError(f"{label} must be timezone-aware")
 
 
+RecurringCommandSeriesState = JobSeriesState
+RecurringCommandSeriesDraft = JobSeriesDraft
+RecurringCommandSeriesRecord = JobSeriesRecord
+RecurringCommandSeriesHandle = JobSeriesHandle
+RecurringCommandStore = JobSeriesStore
+
+
 __all__ = [
     "EndRecurrence",
     "Recurrence",
     "RecurrenceCadence",
+    "JobSeriesDraft",
+    "JobSeriesHandle",
+    "JobSeriesRecord",
+    "JobSeriesState",
+    "JobSeriesStore",
     "RecurringCommandSeriesDraft",
     "RecurringCommandSeriesHandle",
     "RecurringCommandSeriesRecord",
