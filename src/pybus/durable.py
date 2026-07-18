@@ -12,6 +12,12 @@ from uuid import uuid4
 from pybus.envelope import MessageEnvelope
 from pybus.delivery import CommandDeliveryOutcome, CommandDeliveryStatus
 from pybus.exceptions import IndeterminateDeliveryError
+from pybus.exceptions import InvalidMessageDefinitionError
+from pybus.recurrence import (
+    EndRecurrence,
+    RecurringCommandStore,
+    ScheduleNextOccurrence,
+)
 
 
 DURABLE_RECORD_HEADER = "pybus_durable_record"
@@ -27,6 +33,7 @@ class DurableCommandState(StrEnum):
     INDETERMINATE = "indeterminate"
     SUCCEEDED = "succeeded"
     DEAD_LETTERED = "dead_lettered"
+    CANCELLED = "cancelled"
 
 
 class DurableDeliveryDecision(StrEnum):
@@ -75,6 +82,8 @@ class DurableCommandRecord:
     last_attempt_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    series_id: str | None = None
+    occurrence_number: int | None = None
 
     @classmethod
     def from_draft(cls, draft: DurableCommandDraft) -> DurableCommandRecord:
@@ -156,10 +165,19 @@ class DurableCommandHandle:
     message_id: str
     state: DurableCommandState
     created_at: datetime
+    series_id: str | None = None
+    occurrence_number: int | None = None
 
     @classmethod
     def from_record(cls, record: DurableCommandRecord) -> DurableCommandHandle:
-        return cls(record.id, record.message_id, record.state, record.created_at)
+        return cls(
+            record.id,
+            record.message_id,
+            record.state,
+            record.created_at,
+            record.series_id,
+            record.occurrence_number,
+        )
 
 
 class DurableCommandStore(Protocol):
@@ -429,6 +447,27 @@ class DurableCommandController:
                 reconciliation_due_at=datetime.now(timezone.utc)
                 + self.policy.reconciliation_delay,
             )
+
+    def complete_success(
+        self,
+        outcome: CommandDeliveryOutcome,
+        handler_result: object,
+        *,
+        completed_at: datetime,
+    ) -> None:
+        if isinstance(self.store, RecurringCommandStore):
+            handled = self.store.complete_recurring_success(
+                outcome,
+                handler_result,
+                completed_at=completed_at,
+            )
+            if handled:
+                return
+        if isinstance(handler_result, (ScheduleNextOccurrence, EndRecurrence)):
+            raise InvalidMessageDefinitionError(
+                "recurrence results require a recurring durable command"
+            )
+        self.apply_outcome(outcome)
 
 
 class DurableCommandPoller:

@@ -105,8 +105,8 @@ JSON preserves its identity.
 
 ## Durable typed commands
 
-Use the opt-in Django durable-command app when a one-off typed command must be
-committed before any transport publication:
+Use the opt-in Django durable-command app when a typed command must be committed
+before any transport publication:
 
 ```python
 # settings.py
@@ -139,6 +139,37 @@ handle = pybus.schedule_command(GenerateBill(student_id=7))
 
 Pass an `idempotency_key` only when intentional schedule deduplication is
 required.
+
+The same operation can defer a one-off command or attach a recurring lifecycle:
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from pybus import Recurrence, RecurrenceCadence
+
+
+first_run = datetime(2026, 7, 31, 9, tzinfo=ZoneInfo("Africa/Accra"))
+handle = pybus.schedule_command(
+    GenerateBill(student_id=7),
+    run_at=first_run,
+    recurrence=Recurrence(
+        cadence=RecurrenceCadence.MONTHLY,
+        timezone="Africa/Accra",
+    ),
+    idempotency_key="monthly-bill:7",
+)
+```
+
+`run_at` is an optional aware eligibility timestamp: without recurrence it is a
+one-off, and a value at or before the current time is immediately eligible.
+With recurrence, daily, weekly, and monthly schedules retain the original local
+wall-clock anchor, skip missed slots, and create only one successor after a
+successful occurrence. A recurring handler returns `None` for the default
+cadence, `ScheduleNextOccurrence(at=...)` to override only the next run, or
+`EndRecurrence()` to finish. Call `cancel_recurring_command(handle.series_id)`
+to stop an active series. Times must be timezone-aware; `ends_at` is an optional
+exclusive boundary.
 
 Run a durable publisher separately from the ordinary command consumer:
 

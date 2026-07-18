@@ -38,6 +38,7 @@ The core should own the infrastructure concerns:
 - listener loop
 - request/response correlation
 - delivery safety helpers
+- durable future and recurring command lifecycle
 
 The consuming app should own the business concerns:
 
@@ -47,6 +48,7 @@ The consuming app should own the business concerns:
 - idempotency rules
 - domain validation
 - payload shaping
+- exceptional business-calendar decisions
 
 ---
 

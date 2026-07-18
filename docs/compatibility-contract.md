@@ -209,6 +209,13 @@ They do not change legacy handlers or payloads. Observers are process-local,
 metadata-only reconciliation signals and do not strengthen the destructive-pop
 transport into exactly-once or crash-safe delivery.
 
+Durable timing and recurrence are likewise additive. Existing
+`schedule_command(command, idempotency_key=...)` calls keep their immediate
+one-off behavior and existing fingerprint shape. `run_at=` opts into future
+eligibility; `recurrence=` opts into a separate series lifecycle. Neither adds
+fields to transport envelopes or changes `send_command()`, retry, continuation,
+or observer outcome shapes.
+
 These shims are temporary and should be clearly marked deprecated when used.
 Native `Worker` input must never include the terminal failed queue; legacy
 failed-queue processing requires an explicit compatibility/redrive adapter.

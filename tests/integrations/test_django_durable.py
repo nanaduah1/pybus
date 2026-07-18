@@ -37,12 +37,22 @@ if not settings.configured:
 from django.apps import apps
 from django.db import connection, transaction
 
-from pybus import ContinueProcessing, Pybus, command, command_handler
+from pybus import (
+    ContinueProcessing,
+    EndRecurrence,
+    Pybus,
+    Recurrence,
+    RecurrenceCadence,
+    ScheduleNextOccurrence,
+    command,
+    command_handler,
+)
 from pybus.delivery import CommandDeliveryOutcome, CommandDeliveryStatus
 from pybus.durable import (
     DurableCommandPolicy,
     DurableCommandState,
     DurableDeliveryAdmission,
+    DurableSettlement,
 )
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import (
@@ -51,11 +61,15 @@ from pybus.exceptions import (
     IndeterminateDeliveryError,
     WorkerAbortError,
 )
-from pybus.integrations.django_durable.models import DurableCommand
+from pybus.integrations.django_durable.models import (
+    DurableCommand,
+    RecurringCommandSeries,
+)
 from pybus.integrations.django_durable.store import DjangoDurableCommandStore
 from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME
 from pybus.queues import DEFAULT_SLOW_QUEUE_NAME
 from pybus.retries import RetryPolicy
+from pybus.recurrence import RecurringCommandSeriesState
 from pybus.serializer import JsonSerializer
 from pybus.transports.memory import MemoryTransport
 
@@ -95,12 +109,63 @@ class EnqueueThenFail(MemoryTransport):
 
 @pytest.fixture(autouse=True)
 def durable_table():
-    if DurableCommand._meta.db_table not in connection.introspection.table_names():
+    tables = connection.introspection.table_names()
+    if RecurringCommandSeries._meta.db_table not in tables:
+        with connection.schema_editor() as editor:
+            editor.create_model(RecurringCommandSeries)
+    if DurableCommand._meta.db_table not in tables:
         with connection.schema_editor() as editor:
             editor.create_model(DurableCommand)
     DurableCommand.objects.all().delete()
+    RecurringCommandSeries.objects.all().delete()
     yield
     DurableCommand.objects.all().delete()
+    RecurringCommandSeries.objects.all().delete()
+
+
+def _complete_recurring_occurrence(
+    store: DjangoDurableCommandStore,
+    *,
+    at: datetime,
+    result: object = None,
+) -> CommandDeliveryOutcome:
+    claim = store.claim(
+        worker_id="recurrence-test",
+        now=at,
+        lease_expires_at=at + timedelta(seconds=30),
+    )
+    assert claim is not None
+    admission = DurableDeliveryAdmission(
+        record_id=claim.id,
+        generation=claim.generation,
+        source_queue=claim.queue,
+        retry_count=claim.retry_count,
+        max_retries=1,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        payload=claim.payload,
+        application_headers=claim.headers,
+    )
+    assert store.admit_delivery(admission).value == "proceed"
+    outcome = CommandDeliveryOutcome(
+        status=CommandDeliveryStatus.SUCCEEDED,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        source_queue=claim.queue,
+        destination_queue=None,
+        retry_count=claim.retry_count,
+        max_retries=1,
+        durable_record_id=claim.id,
+        durable_generation=claim.generation,
+    )
+    assert store.complete_recurring_success(
+        outcome,
+        result,
+        completed_at=at,
+    )
+    return outcome
 
 
 def test_schedule_participates_in_the_callers_database_transaction() -> None:
@@ -112,6 +177,594 @@ def test_schedule_participates_in_the_callers_database_transaction() -> None:
             raise RuntimeError("rollback")
 
     assert DurableCommand.objects.count() == 0
+
+
+def test_recurring_schedule_and_first_occurrence_are_atomic() -> None:
+    bus = Pybus(MemoryTransport(), durable_command_store=DjangoDurableCommandStore())
+    starts_at = datetime(2026, 7, 20, 9, tzinfo=timezone.utc)
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        with transaction.atomic():
+            bus.schedule_command(
+                BuildReport(report_id=101),
+                run_at=starts_at,
+                recurrence=Recurrence(RecurrenceCadence.DAILY),
+            )
+            raise RuntimeError("rollback")
+
+    assert RecurringCommandSeries.objects.count() == 0
+    assert DurableCommand.objects.count() == 0
+
+
+def test_recurring_success_creates_one_anchored_successor() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    starts_at = datetime(2026, 1, 31, 9, tzinfo=timezone.utc)
+    handle = bus.schedule_command(
+        BuildReport(report_id=102),
+        run_at=starts_at,
+        recurrence=Recurrence(RecurrenceCadence.MONTHLY),
+    )
+
+    _complete_recurring_occurrence(
+        store,
+        at=starts_at + timedelta(hours=1),
+        result=ScheduleNextOccurrence(datetime(2026, 2, 15, 9, tzinfo=timezone.utc)),
+    )
+    _complete_recurring_occurrence(
+        store,
+        at=datetime(2026, 2, 15, 10, tzinfo=timezone.utc),
+    )
+
+    occurrences = list(
+        DurableCommand.objects.filter(series_id=handle.series_id).order_by(
+            "occurrence_number"
+        )
+    )
+    assert [item.occurrence_number for item in occurrences] == [1, 2, 3]
+    assert occurrences[1].available_at == datetime(2026, 2, 15, 9, tzinfo=timezone.utc)
+    assert occurrences[2].available_at == datetime(2026, 2, 28, 9, tzinfo=timezone.utc)
+
+
+def test_recurring_handler_can_end_series_without_a_successor() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    starts_at = datetime(2026, 7, 20, 9, tzinfo=timezone.utc)
+    handle = bus.schedule_command(
+        BuildReport(report_id=103),
+        run_at=starts_at,
+        recurrence=Recurrence(RecurrenceCadence.WEEKLY),
+    )
+
+    _complete_recurring_occurrence(
+        store,
+        at=starts_at + timedelta(minutes=1),
+        result=EndRecurrence(),
+    )
+
+    series = RecurringCommandSeries.objects.get(id=handle.series_id)
+    assert series.state == RecurringCommandSeriesState.COMPLETED
+    assert series.occurrences.count() == 1
+
+
+def test_cancelling_a_pending_series_cancels_its_occurrence() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    handle = bus.schedule_command(
+        BuildReport(report_id=104),
+        run_at=datetime(2026, 8, 1, 9, tzinfo=timezone.utc),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+
+    cancelled = bus.cancel_recurring_command(handle.series_id)
+
+    assert cancelled.state == RecurringCommandSeriesState.CANCELLED
+    assert (
+        DurableCommand.objects.get(id=handle.id).state == DurableCommandState.CANCELLED
+    )
+
+
+def test_recurring_schedule_idempotency_is_owned_by_the_series() -> None:
+    bus = Pybus(MemoryTransport(), durable_command_store=DjangoDurableCommandStore())
+    starts_at = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+    recurrence = Recurrence(RecurrenceCadence.DAILY)
+
+    first = bus.schedule_command(
+        BuildReport(report_id=105),
+        run_at=starts_at,
+        recurrence=recurrence,
+        idempotency_key="daily-report",
+    )
+    second = bus.schedule_command(
+        BuildReport(report_id=105),
+        run_at=starts_at,
+        recurrence=recurrence,
+        idempotency_key="daily-report",
+    )
+
+    assert second == first
+    assert RecurringCommandSeries.objects.count() == 1
+    assert DurableCommand.objects.count() == 1
+
+
+@pytest.mark.parametrize("recurring_first", [False, True])
+def test_idempotency_key_cannot_cross_one_off_and_recurring_modes(
+    recurring_first: bool,
+) -> None:
+    bus = Pybus(MemoryTransport(), durable_command_store=DjangoDurableCommandStore())
+
+    def one_off():
+        return bus.schedule_command(
+            BuildReport(report_id=116),
+            idempotency_key="report-mode:116",
+        )
+
+    def recurring():
+        return bus.schedule_command(
+            BuildReport(report_id=116),
+            recurrence=Recurrence(RecurrenceCadence.DAILY),
+            idempotency_key="report-mode:116",
+        )
+
+    first, second = (recurring, one_off) if recurring_first else (one_off, recurring)
+    first()
+    with pytest.raises(DurableCommandConflictError):
+        second()
+
+
+def test_dead_lettering_an_occurrence_fails_the_series() -> None:
+    @command_handler(BuildReport)
+    def fail(message: BuildReport) -> None:
+        raise RuntimeError("reporting unavailable")
+
+    transport = MemoryTransport()
+    store = DjangoDurableCommandStore()
+    bus = Pybus(
+        transport,
+        durable_command_store=store,
+        handler_targets=[fail],
+    )
+    bus.listener.retry_policy = RetryPolicy(max_retries=0)
+    handle = bus.schedule_command(
+        BuildReport(report_id=106),
+        run_at=django.utils.timezone.now() - timedelta(seconds=1),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+
+    series = RecurringCommandSeries.objects.get(id=handle.series_id)
+    assert series.state == RecurringCommandSeriesState.FAILED
+    assert (
+        DurableCommand.objects.get(id=handle.id).state
+        == DurableCommandState.DEAD_LETTERED
+    )
+
+
+def test_listener_success_advances_a_recurring_series() -> None:
+    @command_handler(BuildReport)
+    def succeed(message: BuildReport) -> None:
+        return None
+
+    transport = MemoryTransport()
+    store = DjangoDurableCommandStore()
+    bus = Pybus(
+        transport,
+        durable_command_store=store,
+        handler_targets=[succeed],
+    )
+    handle = bus.schedule_command(
+        BuildReport(report_id=107),
+        run_at=django.utils.timezone.now() - timedelta(seconds=1),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+
+    occurrences = DurableCommand.objects.filter(series_id=handle.series_id)
+    assert occurrences.count() == 2
+    assert occurrences.get(occurrence_number=1).state == DurableCommandState.SUCCEEDED
+    assert occurrences.get(occurrence_number=2).state == DurableCommandState.PENDING
+
+
+def test_recurrence_result_on_one_off_command_is_a_handler_failure() -> None:
+    @command_handler(BuildReport)
+    def invalid(message: BuildReport) -> EndRecurrence:
+        return EndRecurrence()
+
+    transport = MemoryTransport()
+    store = DjangoDurableCommandStore()
+    bus = Pybus(
+        transport,
+        durable_command_store=store,
+        handler_targets=[invalid],
+    )
+    bus.listener.retry_policy = RetryPolicy(max_retries=0)
+    handle = bus.schedule_command(BuildReport(report_id=108))
+
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert (
+        DurableCommand.objects.get(id=handle.id).state
+        == DurableCommandState.DEAD_LETTERED
+    )
+
+
+def test_invalid_recurring_override_retries_the_same_occurrence() -> None:
+    @command_handler(BuildReport)
+    def invalid(message: BuildReport) -> ScheduleNextOccurrence:
+        return ScheduleNextOccurrence(
+            django.utils.timezone.now() - timedelta(minutes=1)
+        )
+
+    transport = MemoryTransport()
+    store = DjangoDurableCommandStore()
+    bus = Pybus(
+        transport,
+        durable_command_store=store,
+        handler_targets=[invalid],
+    )
+    bus.listener.retry_policy = RetryPolicy(max_retries=1)
+    handle = bus.schedule_command(
+        BuildReport(report_id=109),
+        run_at=django.utils.timezone.now() - timedelta(seconds=1),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+
+    occurrence = DurableCommand.objects.get(id=handle.id)
+    assert occurrence.state == DurableCommandState.PUBLISHED
+    assert occurrence.retry_count == 1
+    assert occurrence.occurrence_number == 1
+    assert DurableCommand.objects.filter(series_id=handle.series_id).count() == 1
+
+
+def test_duplicate_recurring_success_cannot_create_a_second_successor() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    starts_at = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+    handle = bus.schedule_command(
+        BuildReport(report_id=110),
+        run_at=starts_at,
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    completed_at = starts_at + timedelta(minutes=1)
+
+    outcome = _complete_recurring_occurrence(store, at=completed_at)
+    assert store.complete_recurring_success(
+        outcome,
+        None,
+        completed_at=completed_at,
+    )
+
+    assert DurableCommand.objects.filter(series_id=handle.series_id).count() == 2
+
+
+def test_stale_recurring_success_cannot_advance_the_series() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    handle = bus.schedule_command(
+        BuildReport(report_id=121),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    occurrence = DurableCommand.objects.get(id=handle.id)
+    DurableCommand.objects.filter(id=handle.id).update(
+        state=DurableCommandState.RUNNING,
+        generation=2,
+    )
+    stale = CommandDeliveryOutcome(
+        status=CommandDeliveryStatus.SUCCEEDED,
+        message_id=occurrence.message_id,
+        message_type=occurrence.message_type,
+        version=occurrence.version,
+        source_queue=occurrence.queue,
+        destination_queue=None,
+        retry_count=0,
+        max_retries=1,
+        durable_record_id=str(occurrence.id),
+        durable_generation=1,
+    )
+
+    assert not store.complete_recurring_success(
+        stale,
+        None,
+        completed_at=django.utils.timezone.now(),
+    )
+    assert DurableCommand.objects.filter(series_id=handle.series_id).count() == 1
+
+
+def test_continuation_keeps_the_current_recurring_occurrence() -> None:
+    attempts = 0
+
+    @command_handler(BuildReport)
+    def continue_once(message: BuildReport) -> ContinueProcessing | None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return ContinueProcessing()
+        return None
+
+    transport = MemoryTransport()
+    store = DjangoDurableCommandStore()
+    bus = Pybus(
+        transport,
+        durable_command_store=store,
+        handler_targets=[continue_once],
+    )
+    handle = bus.schedule_command(
+        BuildReport(report_id=111),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+    assert DurableCommand.objects.filter(series_id=handle.series_id).count() == 1
+    assert (
+        DurableCommand.objects.get(id=handle.id).state == DurableCommandState.PUBLISHED
+    )
+
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+    assert DurableCommand.objects.filter(series_id=handle.series_id).count() == 2
+
+
+def test_cancellation_after_publication_drops_the_transport_copy() -> None:
+    handled: list[BuildReport] = []
+
+    @command_handler(BuildReport)
+    def handle(message: BuildReport) -> None:
+        handled.append(message)
+
+    transport = MemoryTransport()
+    store = DjangoDurableCommandStore()
+    bus = Pybus(
+        transport,
+        durable_command_store=store,
+        handler_targets=[handle],
+    )
+    scheduled = bus.schedule_command(
+        BuildReport(report_id=112),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+
+    bus.cancel_recurring_command(scheduled.series_id)
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert handled == []
+    assert (
+        DurableCommand.objects.get(id=scheduled.id).state
+        == DurableCommandState.CANCELLED
+    )
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+    assert (
+        DurableCommand.objects.get(id=scheduled.id).state
+        == DurableCommandState.CANCELLED
+    )
+
+
+def test_cancellation_during_execution_allows_success_but_no_successor() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    starts_at = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+    handle = bus.schedule_command(
+        BuildReport(report_id=113),
+        run_at=starts_at,
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    claim = store.claim(
+        worker_id="recurrence-test",
+        now=starts_at,
+        lease_expires_at=starts_at + timedelta(seconds=30),
+    )
+    assert claim is not None
+    admission = DurableDeliveryAdmission(
+        record_id=claim.id,
+        generation=claim.generation,
+        source_queue=claim.queue,
+        retry_count=0,
+        max_retries=1,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        payload=claim.payload,
+        application_headers=claim.headers,
+    )
+    assert store.admit_delivery(admission).value == "proceed"
+    bus.cancel_recurring_command(handle.series_id)
+    outcome = CommandDeliveryOutcome(
+        status=CommandDeliveryStatus.SUCCEEDED,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        source_queue=claim.queue,
+        destination_queue=None,
+        retry_count=0,
+        max_retries=1,
+        durable_record_id=claim.id,
+        durable_generation=claim.generation,
+    )
+
+    assert store.complete_recurring_success(
+        outcome,
+        None,
+        completed_at=starts_at + timedelta(minutes=1),
+    )
+    assert DurableCommand.objects.filter(series_id=handle.series_id).count() == 1
+    assert (
+        DurableCommand.objects.get(id=handle.id).state == DurableCommandState.SUCCEEDED
+    )
+
+
+def test_cancellation_during_a_failed_attempt_drops_its_retry() -> None:
+    transport = MemoryTransport()
+    store = DjangoDurableCommandStore()
+    scheduled = None
+
+    @command_handler(BuildReport)
+    def cancel_then_fail(message: BuildReport) -> None:
+        assert scheduled is not None
+        bus.cancel_recurring_command(scheduled.series_id)
+        raise RuntimeError("cancelled while running")
+
+    bus = Pybus(
+        transport,
+        durable_command_store=store,
+        handler_targets=[cancel_then_fail],
+    )
+    bus.listener.retry_policy = RetryPolicy(max_retries=1)
+    scheduled = bus.schedule_command(
+        BuildReport(report_id=114),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    bus.create_durable_command_worker(error_delay=0).run(max_iterations=1)
+
+    bus.listen_once(DEFAULT_QUEUE_NAME)
+    assert (
+        DurableCommand.objects.get(id=scheduled.id).state
+        == DurableCommandState.CANCELLED
+    )
+
+
+def test_cancellation_terminalizes_an_abandoned_running_occurrence() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    starts_at = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+    handle = bus.schedule_command(
+        BuildReport(report_id=117),
+        run_at=starts_at,
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    claim = store.claim(
+        worker_id="lost-worker",
+        now=starts_at,
+        lease_expires_at=starts_at + timedelta(seconds=30),
+    )
+    assert claim is not None
+    admission = DurableDeliveryAdmission(
+        record_id=claim.id,
+        generation=claim.generation,
+        source_queue=claim.queue,
+        retry_count=0,
+        max_retries=1,
+        message_id=claim.message_id,
+        message_type=claim.message_type,
+        version=claim.version,
+        payload=claim.payload,
+        application_headers=claim.headers,
+        reconciliation_due_at=starts_at + timedelta(seconds=30),
+    )
+    assert store.admit_delivery(admission).value == "proceed"
+    bus.cancel_recurring_command(handle.series_id)
+
+    assert (
+        store.claim(
+            worker_id="recovery",
+            now=starts_at + timedelta(minutes=1),
+            lease_expires_at=starts_at + timedelta(minutes=2),
+        )
+        is None
+    )
+    assert (
+        DurableCommand.objects.get(id=handle.id).state == DurableCommandState.CANCELLED
+    )
+
+
+def test_cancellation_terminalizes_an_occurrence_during_settlement() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    starts_at = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+    handle = bus.schedule_command(
+        BuildReport(report_id=118),
+        run_at=starts_at,
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    claim = store.claim(
+        worker_id="settling-worker",
+        now=starts_at,
+        lease_expires_at=starts_at + timedelta(seconds=30),
+    )
+    assert claim is not None
+    DurableCommand.objects.filter(id=handle.id).update(
+        state=DurableCommandState.RUNNING,
+        max_retries=1,
+    )
+    store.checkpoint_settlement(
+        DurableSettlement(
+            record_id=claim.id,
+            generation=claim.generation,
+            status=CommandDeliveryStatus.CONTINUED,
+            source_queue=claim.queue,
+            destination_queue=claim.queue,
+            retry_count=0,
+            max_retries=1,
+            reconciliation_due_at=starts_at + timedelta(minutes=1),
+        )
+    )
+
+    bus.cancel_recurring_command(handle.series_id)
+
+    assert (
+        DurableCommand.objects.get(id=handle.id).state == DurableCommandState.CANCELLED
+    )
+
+
+def test_dead_letter_acknowledgement_recovery_fails_the_series() -> None:
+    store = DjangoDurableCommandStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    starts_at = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+    handle = bus.schedule_command(
+        BuildReport(report_id=119),
+        run_at=starts_at,
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    claim = store.claim(
+        worker_id="dead-letter-worker",
+        now=starts_at,
+        lease_expires_at=starts_at + timedelta(seconds=30),
+    )
+    assert claim is not None
+    DurableCommand.objects.filter(id=handle.id).update(
+        state=DurableCommandState.RUNNING,
+        max_retries=0,
+    )
+    store.checkpoint_settlement(
+        DurableSettlement(
+            record_id=claim.id,
+            generation=claim.generation,
+            status=CommandDeliveryStatus.DEAD_LETTERED,
+            source_queue=claim.queue,
+            destination_queue=DEFAULT_FAILED_QUEUE_NAME,
+            retry_count=0,
+            max_retries=0,
+            reconciliation_due_at=starts_at - timedelta(seconds=1),
+        )
+    )
+    recovered = store.claim(
+        worker_id="recovery",
+        now=starts_at,
+        lease_expires_at=starts_at + timedelta(seconds=30),
+    )
+    assert recovered is not None
+
+    store.mark_published(
+        recovered,
+        now=starts_at,
+        reconciliation_due_at=starts_at + timedelta(minutes=1),
+    )
+
+    assert (
+        DurableCommand.objects.get(id=handle.id).state
+        == DurableCommandState.DEAD_LETTERED
+    )
+    assert (
+        RecurringCommandSeries.objects.get(id=handle.series_id).state
+        == RecurringCommandSeriesState.FAILED
+    )
 
 
 def test_nested_savepoint_rollback_discards_only_inner_schedule() -> None:
@@ -156,6 +809,36 @@ def test_reverse_migration_refuses_to_drop_nonempty_table() -> None:
 
     with pytest.raises(RuntimeError, match="contains data"):
         migration.refuse_nonempty_reverse(apps, SimpleNamespace(connection=connection))
+
+
+def test_recurrence_migration_refuses_to_drop_series_data() -> None:
+    bus = Pybus(MemoryTransport(), durable_command_store=DjangoDurableCommandStore())
+    bus.schedule_command(
+        BuildReport(report_id=115),
+        recurrence=Recurrence(RecurrenceCadence.DAILY),
+    )
+    migration = import_module(
+        "pybus.integrations.django_durable.migrations.0002_recurring_commands"
+    )
+
+    with pytest.raises(RuntimeError, match="recurring-command storage"):
+        migration.refuse_recurrence_reverse(
+            apps,
+            SimpleNamespace(connection=connection),
+        )
+
+
+def test_recurrence_migration_can_reverse_with_only_legacy_one_off_rows() -> None:
+    bus = Pybus(MemoryTransport(), durable_command_store=DjangoDurableCommandStore())
+    bus.schedule_command(BuildReport(report_id=120))
+    migration = import_module(
+        "pybus.integrations.django_durable.migrations.0002_recurring_commands"
+    )
+
+    migration.refuse_recurrence_reverse(
+        apps,
+        SimpleNamespace(connection=connection),
+    )
 
 
 def test_django_store_runs_the_command_to_an_irreversible_terminal_state() -> None:

@@ -245,6 +245,13 @@ pass can legitimately need more work so the native worker cannot tight-loop.
 This delay blocks the worker and is not durable scheduling; keep long waits in
 the scheduler and preserve an application-level progress or stall ceiling.
 
+Applications using the optional Django durable-command store should apply its
+new migrations before scheduling recurring work. Existing one-off rows remain
+valid. A future one-off uses `schedule_command(command, run_at=...)`; recurring
+work adds `recurrence=Recurrence(...)` to the same call. Do not reverse the
+recurrence migration while any series data remains—the guarded reverse refuses
+to discard it.
+
 Outbox/inbox flows should be treated as a durability upgrade path, not as a
 new core capability in v1.
 

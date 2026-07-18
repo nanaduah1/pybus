@@ -49,5 +49,13 @@ class DurableCommandConflictError(PybusError):
     """Raised when an idempotency key identifies a different command."""
 
 
+class DurableRecurrenceNotSupportedError(PybusError):
+    """Raised when recurrence is used with a one-off-only durable store."""
+
+
+class RecurringCommandSeriesNotFoundError(LookupError, PybusError):
+    """Raised when a recurring command series cannot be found."""
+
+
 class InvalidMessageDefinitionError(ValueError, PybusError):
     """Raised when a message or envelope definition is invalid."""

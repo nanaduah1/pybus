@@ -3,6 +3,7 @@ from pybus.composition import BusConfiguration
 from pybus.codecs import PayloadCodec, PayloadTypeRegistry, PythonPayloadCodec
 from pybus.bus import (
     Pybus,
+    cancel_recurring_command,
     configure_transport,
     get_bus,
     prepare_command,
@@ -30,8 +31,18 @@ from pybus.exceptions import (
     DeliveryObservationError,
     DurableCommandConflictError,
     DurableCommandsNotConfiguredError,
+    DurableRecurrenceNotSupportedError,
     IndeterminateDeliveryError,
+    RecurringCommandSeriesNotFoundError,
     WorkerAbortError,
+)
+from pybus.recurrence import (
+    EndRecurrence,
+    Recurrence,
+    RecurrenceCadence,
+    RecurringCommandSeriesHandle,
+    RecurringCommandSeriesState,
+    ScheduleNextOccurrence,
 )
 from pybus.handlers import (
     MAX_CONTINUATION_DELAY_SECONDS,
@@ -79,6 +90,7 @@ from pybus.worker import Worker, WorkerHook
 __all__ = [
     "BaseMessage",
     "BusConfiguration",
+    "cancel_recurring_command",
     "CommandMessage",
     "CommandDeliveryObserver",
     "CommandDeliveryOutcome",
@@ -139,6 +151,14 @@ __all__ = [
     "DurableCommandStore",
     "DurableCommandConflictError",
     "DurableCommandsNotConfiguredError",
+    "DurableRecurrenceNotSupportedError",
+    "EndRecurrence",
+    "Recurrence",
+    "RecurrenceCadence",
+    "RecurringCommandSeriesHandle",
+    "RecurringCommandSeriesNotFoundError",
+    "RecurringCommandSeriesState",
+    "ScheduleNextOccurrence",
     "Transport",
     "Worker",
     "WorkerAbortError",

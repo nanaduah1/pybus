@@ -464,16 +464,49 @@ these outcomes in version one.
 The opt-in durable path persists a typed command before publication:
 
 ```python
-handle = pybus.schedule_command(command, idempotency_key=None)
+handle = pybus.schedule_command(
+    command,
+    run_at=None,
+    recurrence=None,
+    idempotency_key=None,
+)
 bus.create_durable_command_worker().run()
 ```
 
 `send_command()` remains the immediate transport API. `schedule_command()` has
-no queue, header, or timing controls: routing is declared on the command and
-scheduling stores the canonical logical envelope without transport I/O.
+routing declared on the command and stores the canonical logical envelope
+without transport I/O. With no timing context it is immediately eligible;
+`run_at` is an aware eligibility timestamp, so a future value defers a one-off
+and a value at or before the current time is immediately eligible.
 Without a configured `durable_command_store_factory` (or low-level
 `durable_command_store`), both durable APIs raise
 `DurableCommandsNotConfiguredError`.
+
+An optional `Recurrence` adds a durable series lifecycle to that same command:
+
+```python
+recurrence = pybus.Recurrence(
+    cadence=pybus.RecurrenceCadence.MONTHLY,
+    timezone="Africa/Accra",
+    ends_at=None,
+)
+handle = pybus.schedule_command(command, run_at=first_run, recurrence=recurrence)
+```
+
+Daily, weekly, and monthly cadences preserve the first run's local wall-clock
+anchor. Monthly schedules clamp missing days without drift; timezone gaps move
+forward by the transition gap and folds choose the earlier instant. Successful
+`None` creates the first anchored slot strictly after completion, skipping
+missed slots. `ScheduleNextOccurrence(at=...)` overrides only the next run;
+`EndRecurrence()` completes the series. An aware `ends_at` is exclusive.
+`cancel_recurring_command(handle.series_id)` is idempotent and prevents a
+terminal or cancelled series from producing another occurrence.
+
+Each occurrence is an ordinary durable command with a distinct message ID and
+monotonic occurrence number. Success and its single successor are committed in
+one store transaction. Retry and `ContinueProcessing` retain the current
+occurrence; dead-lettering fails the series. These guarantees prevent duplicate
+successors, but domain handler execution remains at-least-once.
 
 `DurableCommandPolicy` configures publisher-claim lease duration and the
 reconciliation delay used by publishers and consumers. It is set once on

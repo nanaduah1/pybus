@@ -19,10 +19,12 @@ from pybus.exceptions import (
     DeliveryObservationError,
     HandlerNotFoundError,
     IndeterminateDeliveryError,
+    InvalidMessageDefinitionError,
     WorkerAbortError,
 )
 from pybus.handlers import ContinueProcessing, HandlerSpec, _handler_spec
 from pybus.messages import CommandMessage, RequestMessage, ResponseMessage
+from pybus.recurrence import EndRecurrence, ScheduleNextOccurrence
 from pybus.queues import (
     DEFAULT_FAILED_QUEUE_NAME as _DEFAULT_FAILED_QUEUE_NAME,
     DEFAULT_QUEUE_NAME as _DEFAULT_QUEUE_NAME,
@@ -330,9 +332,45 @@ class Listener:
                 results.append(None)
                 continue
 
+            if isinstance(result, (ScheduleNextOccurrence, EndRecurrence)) and (
+                envelope.message_kind != CommandMessage.message_kind or not is_durable
+            ):
+                self._handle_failed_delivery(channel_name, envelope, spec)
+                return None
+
             results.append(result)
 
         if command_max_retries is not None and not continued:
+            if is_durable and self._durable_command_controller is not None:
+                outcome = self._command_delivery_outcome(
+                    envelope,
+                    status=CommandDeliveryStatus.SUCCEEDED,
+                    source_queue=channel_name,
+                    destination_queue=None,
+                    retry_count=self._retry_count(envelope),
+                    max_retries=command_max_retries,
+                )
+                try:
+                    self._durable_command_controller.complete_success(
+                        outcome,
+                        results[0],
+                        completed_at=self._now_fn(),
+                    )
+                except InvalidMessageDefinitionError:
+                    self._handle_failed_delivery(
+                        channel_name,
+                        envelope,
+                        self._spec_for(handlers[0]),
+                    )
+                    return None
+                except Exception as exc:
+                    self._logger.exception(
+                        "Durable command success settlement failed for %s",
+                        envelope.message_id,
+                    )
+                    raise DeliveryObservationError(
+                        "durable command success settlement failed after handler completion"
+                    ) from exc
             self._notify_command_outcome(
                 envelope,
                 status=CommandDeliveryStatus.SUCCEEDED,
@@ -340,6 +378,7 @@ class Listener:
                 destination_queue=None,
                 retry_count=self._retry_count(envelope),
                 max_retries=command_max_retries,
+                apply_durable=not is_durable,
             )
 
         return results[0] if len(results) == 1 else results
@@ -669,29 +708,20 @@ class Listener:
         destination_queue: str | None,
         retry_count: int,
         max_retries: int,
+        apply_durable: bool = True,
     ) -> None:
         if envelope.message_kind != CommandMessage.message_kind:
             return
-        durable_record_id = envelope.headers.get("pybus_durable_record")
-        durable_generation = envelope.headers.get("pybus_durable_generation")
-        if durable_record_id is not None and not isinstance(durable_record_id, str):
-            durable_record_id = None
-        if durable_generation is not None and not isinstance(durable_generation, int):
-            durable_generation = None
-        outcome = CommandDeliveryOutcome(
+        outcome = self._command_delivery_outcome(
+            envelope,
             status=status,
-            message_id=envelope.message_id,
-            message_type=envelope.message_type,
-            version=envelope.version,
             source_queue=source_queue,
             destination_queue=destination_queue,
             retry_count=retry_count,
             max_retries=max_retries,
-            durable_record_id=durable_record_id,
-            durable_generation=durable_generation,
         )
         failures: list[Exception] = []
-        if self._durable_command_controller is not None:
+        if apply_durable and self._durable_command_controller is not None:
             try:
                 self._durable_command_controller.apply_outcome(outcome)
             except Exception as exc:
@@ -711,6 +741,35 @@ class Listener:
             raise DeliveryObservationError(
                 "command delivery observer failed after a known message settlement"
             ) from failures[0]
+
+    @staticmethod
+    def _command_delivery_outcome(
+        envelope: MessageEnvelope,
+        *,
+        status: CommandDeliveryStatus,
+        source_queue: str,
+        destination_queue: str | None,
+        retry_count: int,
+        max_retries: int,
+    ) -> CommandDeliveryOutcome:
+        durable_record_id = envelope.headers.get("pybus_durable_record")
+        durable_generation = envelope.headers.get("pybus_durable_generation")
+        if durable_record_id is not None and not isinstance(durable_record_id, str):
+            durable_record_id = None
+        if durable_generation is not None and not isinstance(durable_generation, int):
+            durable_generation = None
+        return CommandDeliveryOutcome(
+            status=status,
+            message_id=envelope.message_id,
+            message_type=envelope.message_type,
+            version=envelope.version,
+            source_queue=source_queue,
+            destination_queue=destination_queue,
+            retry_count=retry_count,
+            max_retries=max_retries,
+            durable_record_id=durable_record_id,
+            durable_generation=durable_generation,
+        )
 
     def _checkpoint_durable_settlement(
         self,

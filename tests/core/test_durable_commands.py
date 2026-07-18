@@ -10,6 +10,8 @@ import pybus
 from pybus import (
     BusConfiguration,
     Pybus,
+    Recurrence,
+    RecurrenceCadence,
     command,
     command_handler,
     event,
@@ -28,9 +30,14 @@ from pybus.durable import (
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import DurableCommandsNotConfiguredError
 from pybus.exceptions import (
+    DurableRecurrenceNotSupportedError,
     IndeterminateDeliveryError,
     InvalidMessageDefinitionError,
     WorkerAbortError,
+)
+from pybus.recurrence import (
+    RecurringCommandSeriesRecord,
+    RecurringCommandSeriesState,
 )
 from pybus.listener import DEFAULT_QUEUE_NAME
 from pybus.retries import RetryPolicy
@@ -126,6 +133,45 @@ class RecordingDurableStore:
         self.releases.append((record_id, generation, reconciliation_due_at))
 
 
+class RecordingRecurringStore(RecordingDurableStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.series = {}
+
+    def schedule_recurring(self, draft):
+        record = DurableCommandRecord.from_draft(draft.first_occurrence)
+        series_id = f"series-{len(self.series) + 1}"
+        record = replace(record, series_id=series_id, occurrence_number=1)
+        self.records[record.id] = record
+        series = RecurringCommandSeriesRecord(
+            id=series_id,
+            state=RecurringCommandSeriesState.ACTIVE,
+            cadence=draft.recurrence.cadence,
+            timezone=draft.recurrence.timezone,
+            starts_at=draft.starts_at,
+            ends_at=draft.recurrence.ends_at,
+            fingerprint=draft.fingerprint,
+            idempotency_key=draft.idempotency_key,
+            latest_occurrence_number=1,
+            latest_occurrence_id=record.id,
+            latest_message_id=record.message_id,
+            latest_run_at=record.available_at,
+            created_at=record.created_at,
+        )
+        self.series[series_id] = series
+        return series, record
+
+    def cancel_recurring(self, *, series_id, cancelled_at):
+        return self.series[series_id]
+
+    def complete_recurring_success(
+        self, outcome, handler_result, *, completed_at
+    ) -> bool:
+        return outcome.durable_record_id in self.records and bool(
+            self.records[outcome.durable_record_id].series_id
+        )
+
+
 def test_schedule_command_is_concise_and_performs_no_transport_io() -> None:
     transport = MemoryTransport()
     store = RecordingDurableStore()
@@ -137,6 +183,42 @@ def test_schedule_command_is_concise_and_performs_no_transport_io() -> None:
     assert handle.message_id == store.scheduled[0].message_id
     assert store.scheduled[0].queue == DEFAULT_QUEUE_NAME
     assert transport.size(DEFAULT_QUEUE_NAME) == 0
+
+
+def test_schedule_command_accepts_future_and_recurring_context() -> None:
+    store = RecordingRecurringStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    run_at = datetime(2027, 1, 31, 9, tzinfo=timezone.utc)
+
+    handle = bus.schedule_command(
+        GenerateBill(student_id=7),
+        run_at=run_at,
+        recurrence=Recurrence(RecurrenceCadence.MONTHLY),
+    )
+
+    assert handle.series_id == "series-1"
+    assert handle.occurrence_number == 1
+    assert store.records[handle.id].available_at == run_at
+
+
+def test_future_one_off_uses_run_at_without_requiring_recurrence_support() -> None:
+    store = RecordingDurableStore()
+    bus = Pybus(MemoryTransport(), durable_command_store=store)
+    run_at = datetime(2027, 1, 31, 9, tzinfo=timezone.utc)
+
+    handle = bus.schedule_command(GenerateBill(student_id=7), run_at=run_at)
+
+    assert store.records[handle.id].available_at == run_at
+
+
+def test_recurrence_requires_an_explicit_store_capability() -> None:
+    bus = Pybus(MemoryTransport(), durable_command_store=RecordingDurableStore())
+
+    with pytest.raises(DurableRecurrenceNotSupportedError):
+        bus.schedule_command(
+            GenerateBill(student_id=7),
+            recurrence=Recurrence(RecurrenceCadence.DAILY),
+        )
 
 
 def test_top_level_schedule_command_uses_the_configured_bus() -> None:

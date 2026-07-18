@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
 import time
 from dataclasses import dataclass
 from threading import Event
@@ -22,6 +23,7 @@ from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.exceptions import (
     DurableCommandsNotConfiguredError,
+    DurableRecurrenceNotSupportedError,
     InvalidMessageDefinitionError,
     MessageTimeoutError,
 )
@@ -40,6 +42,12 @@ from pybus.queues import QueueTopology
 from pybus.request_response import (
     RequestResponseCoordinator,
     default_reply_queue_name,
+)
+from pybus.recurrence import (
+    Recurrence,
+    RecurringCommandSeriesDraft,
+    RecurringCommandSeriesHandle,
+    RecurringCommandStore,
 )
 from pybus.serializer import JsonSerializer
 from pybus.worker import Worker, WorkerHook
@@ -193,7 +201,12 @@ class Pybus:
         )
 
     def schedule_command(
-        self, command: object, *, idempotency_key: str | None = None
+        self,
+        command: object,
+        *,
+        run_at: datetime | None = None,
+        recurrence: Recurrence | None = None,
+        idempotency_key: str | None = None,
     ) -> DurableCommandHandle:
         if self.durable_command_store is None:
             raise DurableCommandsNotConfiguredError(
@@ -211,32 +224,92 @@ class Pybus:
             raise InvalidMessageDefinitionError(
                 "idempotency_key must be a non-empty string of at most 255 characters"
             )
+        if run_at is not None:
+            if (
+                not isinstance(run_at, datetime)
+                or run_at.tzinfo is None
+                or run_at.utcoffset() is None
+            ):
+                raise InvalidMessageDefinitionError("run_at must be timezone-aware")
+        if recurrence is not None and not isinstance(recurrence, Recurrence):
+            raise InvalidMessageDefinitionError("recurrence must be a Recurrence")
         envelope = self.prepare_command(command)
         queue = self._resolve_publication_queue(command, None)
-        fingerprint = self.serializer.dumps(
-            {
-                "message_type": envelope.message_type,
-                "version": envelope.version,
-                "payload": envelope.payload,
-                "headers": envelope.headers,
-                "queue": queue,
-            }
+        normalized_run_at = (
+            envelope.created_at if run_at is None else run_at.astimezone(timezone.utc)
         )
-        record = self.durable_command_store.schedule(
-            DurableCommandDraft(
-                message_id=envelope.message_id,
-                message_type=envelope.message_type,
-                version=envelope.version,
-                payload=envelope.payload,
-                headers=dict(envelope.headers),
-                created_at=envelope.created_at,
-                available_at=envelope.created_at,
-                queue=queue,
-                fingerprint=fingerprint,
-                idempotency_key=idempotency_key,
+        fingerprint_fields = {
+            "message_type": envelope.message_type,
+            "version": envelope.version,
+            "payload": envelope.payload,
+            "headers": envelope.headers,
+            "queue": queue,
+        }
+        if run_at is not None:
+            fingerprint_fields["run_at"] = normalized_run_at.isoformat()
+        if recurrence is not None:
+            normalized_end = (
+                None
+                if recurrence.ends_at is None
+                else recurrence.ends_at.astimezone(timezone.utc)
             )
+            if normalized_end is not None and normalized_run_at >= normalized_end:
+                raise InvalidMessageDefinitionError("run_at must be before ends_at")
+            fingerprint_fields["recurrence"] = {
+                "cadence": recurrence.cadence.value,
+                "timezone": recurrence.timezone,
+                "ends_at": (
+                    None if normalized_end is None else normalized_end.isoformat()
+                ),
+                "run_at": (None if run_at is None else normalized_run_at.isoformat()),
+            }
+        fingerprint = self.serializer.dumps(fingerprint_fields)
+        draft = DurableCommandDraft(
+            message_id=envelope.message_id,
+            message_type=envelope.message_type,
+            version=envelope.version,
+            payload=envelope.payload,
+            headers=dict(envelope.headers),
+            created_at=envelope.created_at,
+            available_at=normalized_run_at,
+            queue=queue,
+            fingerprint=fingerprint,
+            idempotency_key=idempotency_key,
         )
+        if recurrence is not None:
+            if not isinstance(self.durable_command_store, RecurringCommandStore):
+                raise DurableRecurrenceNotSupportedError(
+                    "configured durable store does not support recurrence"
+                )
+            _, record = self.durable_command_store.schedule_recurring(
+                RecurringCommandSeriesDraft(
+                    first_occurrence=draft,
+                    recurrence=recurrence,
+                    starts_at=normalized_run_at,
+                    fingerprint=fingerprint,
+                    idempotency_key=idempotency_key,
+                )
+            )
+        else:
+            record = self.durable_command_store.schedule(draft)
         return DurableCommandHandle.from_record(record)
+
+    def cancel_recurring_command(self, series_id: str) -> RecurringCommandSeriesHandle:
+        if self.durable_command_store is None:
+            raise DurableCommandsNotConfiguredError(
+                "durable commands require a durable_command_store"
+            )
+        if not isinstance(self.durable_command_store, RecurringCommandStore):
+            raise DurableRecurrenceNotSupportedError(
+                "configured durable store does not support recurrence"
+            )
+        if not isinstance(series_id, str) or not series_id.strip():
+            raise InvalidMessageDefinitionError("series_id must be a non-empty string")
+        record = self.durable_command_store.cancel_recurring(
+            series_id=series_id,
+            cancelled_at=datetime.now(timezone.utc),
+        )
+        return RecurringCommandSeriesHandle.from_record(record)
 
     def create_durable_command_worker(
         self,
@@ -610,9 +683,22 @@ def send_command(
 
 
 def schedule_command(
-    command: object, *, idempotency_key: str | None = None
+    command: object,
+    *,
+    run_at: datetime | None = None,
+    recurrence: Recurrence | None = None,
+    idempotency_key: str | None = None,
 ) -> DurableCommandHandle:
-    return get_bus().schedule_command(command, idempotency_key=idempotency_key)
+    return get_bus().schedule_command(
+        command,
+        run_at=run_at,
+        recurrence=recurrence,
+        idempotency_key=idempotency_key,
+    )
+
+
+def cancel_recurring_command(series_id: str) -> RecurringCommandSeriesHandle:
+    return get_bus().cancel_recurring_command(series_id)
 
 
 def prepare_event(
