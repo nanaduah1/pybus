@@ -5,13 +5,20 @@ from datetime import datetime, timezone
 from typing import Any
 
 DEFAULT_RETRY_LIMIT = 10
-DEFAULT_RETRY_DELAY = 0
+DEFAULT_RETRY_DELAY = 0.0
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
+    """Controls retry behaviour in Listener.
+
+    max_retries: maximum requeue attempts before dead-lettering.
+    delay: base sleep in seconds before each requeue; 0 = immediate (default).
+    backoff_factor: multiplier applied per attempt — sleep = delay * (backoff_factor ** attempt).
+    """
+
     max_retries: int = DEFAULT_RETRY_LIMIT
-    delay: int = DEFAULT_RETRY_DELAY
+    delay: float = DEFAULT_RETRY_DELAY
     backoff_factor: float = 1.0
 
     def should_retry(self, retries: int) -> bool:

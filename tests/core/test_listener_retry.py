@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from pybus.dispatcher import Dispatcher
 from pybus.envelope import MessageEnvelope
 from pybus.listener import DEFAULT_FAILED_QUEUE_NAME, DEFAULT_QUEUE_NAME, Listener
@@ -58,6 +60,78 @@ def test_listener_retries_failed_message_before_dead_letter() -> None:
     assert dead_letter.message_id == "msg-1"
     assert dead_letter.headers["dead_lettered_from"] == DEFAULT_QUEUE_NAME
     assert dead_letter.payload["retries"] == 1
+
+
+def test_listener_applies_retry_delay_from_policy() -> None:
+    registry = Registry()
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=2, delay=2, backoff_factor=2.0),
+    )
+
+    def always_fail(message: EventMessage) -> None:
+        raise RuntimeError("fail")
+
+    registry.register("event", "student.enrolled", always_fail)
+
+    envelope = EventMessage(
+        message_type="student.enrolled",
+        payload={"student_id": "S-delay"},
+    ).to_envelope(message_id="msg-delay-1")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+
+    with patch("pybus.listener.time.sleep") as mock_sleep:
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    # First retry: attempt=0, delay = 2 * (2.0 ** 0) = 2.0
+    mock_sleep.assert_called_once_with(2.0)
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+
+    retry_envelope = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_QUEUE_NAME))
+    )
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(retry_envelope))
+
+    with patch("pybus.listener.time.sleep") as mock_sleep2:
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    # Second retry: attempt=1, delay = 2 * (2.0 ** 1) = 4.0
+    mock_sleep2.assert_called_once_with(4.0)
+
+
+def test_listener_zero_delay_does_not_sleep() -> None:
+    registry = Registry()
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1, delay=0),
+    )
+
+    def always_fail(message: EventMessage) -> None:
+        raise RuntimeError("fail")
+
+    registry.register("event", "student.enrolled", always_fail)
+
+    envelope = EventMessage(
+        message_type="student.enrolled",
+        payload={"student_id": "S-nodelay"},
+    ).to_envelope(message_id="msg-nodelay-1")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+
+    with patch("pybus.listener.time.sleep") as mock_sleep:
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    mock_sleep.assert_not_called()
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
 def test_listener_consumes_first_available_channel_from_sequence() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
@@ -92,6 +93,11 @@ class Listener:
             return 0
 
     def _requeue(self, channel_name: str, envelope: MessageEnvelope) -> None:
+        # Blocks the listener for the configured delay. On multi-channel listeners
+        # this stalls all channels for the duration; keep delay values small.
+        delay = self.retry_policy.next_delay(self._retry_count(envelope))
+        if delay > 0:
+            time.sleep(delay)
         now = datetime.now(timezone.utc)
         if isinstance(envelope.payload, dict):
             payload = next_retry_payload(envelope.payload, attempted_at=now)
