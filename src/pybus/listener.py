@@ -620,8 +620,13 @@ class Listener:
         *,
         max_retries: int,
     ) -> None:
-        now = self._now_fn()
+        # Blocks the listener for the configured delay. On multi-channel listeners
+        # this stalls all channels for the duration; keep delay values small.
         retries = self._retry_count(envelope)
+        delay = self.retry_policy.next_delay(retries)
+        if delay > 0:
+            self._sleep_fn(delay)
+        now = self._now_fn()
         if not self._is_typed(envelope) and isinstance(envelope.payload, dict):
             payload = next_retry_payload(
                 envelope.payload,

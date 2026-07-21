@@ -1059,3 +1059,72 @@ def test_malformed_ordinary_message_is_terminal_and_next_message_survives() -> N
     )
     assert poison.message_type == "pybus.message.decode_failed"
     assert poison.headers == {"dead_lettered_from": DEFAULT_QUEUE_NAME}
+
+
+def test_listener_applies_retry_delay_from_policy() -> None:
+    sleep_calls: list[float] = []
+    registry = Registry()
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=2, delay=2, backoff_factor=2.0),
+        sleep_fn=sleep_calls.append,
+    )
+
+    def always_fail(message: EventMessage) -> None:
+        raise RuntimeError("fail")
+
+    registry.register("event", "student.enrolled", always_fail)
+
+    envelope = EventMessage(
+        message_type="student.enrolled",
+        payload={"student_id": "S-delay"},
+    ).to_envelope(message_id="msg-delay-1")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+    # attempt=0: delay = 2 * (2.0 ** 0) = 2.0
+    assert sleep_calls == [2.0]
+
+    retry_envelope = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_QUEUE_NAME))
+    )
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(retry_envelope))
+    sleep_calls.clear()
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+    # attempt=1: delay = 2 * (2.0 ** 1) = 4.0
+    assert sleep_calls == [4.0]
+
+
+def test_listener_zero_delay_does_not_sleep() -> None:
+    sleep_calls: list[float] = []
+    registry = Registry()
+    transport = MemoryTransport()
+    serializer = JsonSerializer()
+    dispatcher = Dispatcher(registry=registry, serializer=serializer)
+    listener = Listener(
+        transport=transport,
+        dispatcher=dispatcher,
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1, delay=0),
+        sleep_fn=sleep_calls.append,
+    )
+
+    def always_fail(message: EventMessage) -> None:
+        raise RuntimeError("fail")
+
+    registry.register("event", "student.enrolled", always_fail)
+
+    envelope = EventMessage(
+        message_type="student.enrolled",
+        payload={"student_id": "S-nodelay"},
+    ).to_envelope(message_id="msg-nodelay-1")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+    assert sleep_calls == []
