@@ -13,7 +13,7 @@ DEFAULT_RETRY_DELAY = 0
 @dataclass(frozen=True)
 class RetryPolicy:
     max_retries: int = DEFAULT_RETRY_LIMIT
-    delay: int = DEFAULT_RETRY_DELAY
+    delay: float = DEFAULT_RETRY_DELAY
     backoff_factor: float = 1.0
 
     def __post_init__(self) -> None:
