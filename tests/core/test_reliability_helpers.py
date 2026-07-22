@@ -97,3 +97,65 @@ def test_request_response_round_trip_and_timeout() -> None:
 
     with pytest.raises(MessageTimeoutError):
         coordinator.wait_for_response("missing", timeout=0)
+
+
+def test_request_response_round_trip_leaves_cache_empty() -> None:
+    coordinator = RequestResponseCoordinator()
+    request = RequestMessage(
+        message_type="billing.get_invoice",
+        payload={"invoice_id": "INV-1"},
+    )
+    response = ResponseMessage(
+        message_type="billing.get_invoice.response",
+        payload={"invoice_id": "INV-1", "total": 100},
+    )
+
+    request_envelope, ticket = coordinator.prepare_request(request, timeout=5)
+    response_envelope = coordinator.prepare_response(request_envelope, response)
+    coordinator.store_response(response_envelope)
+    coordinator.wait_for_response(ticket.correlation_id, timeout=1)
+
+    assert coordinator._responses == {}
+
+
+def test_late_response_after_timeout_does_not_leak() -> None:
+    coordinator = RequestResponseCoordinator()
+    request = RequestMessage(
+        message_type="billing.get_invoice",
+        payload={"invoice_id": "INV-1"},
+    )
+    response = ResponseMessage(
+        message_type="billing.get_invoice.response",
+        payload={"invoice_id": "INV-1", "total": 100},
+    )
+
+    request_envelope, ticket = coordinator.prepare_request(request, timeout=5)
+
+    with pytest.raises(MessageTimeoutError):
+        coordinator.wait_for_response(ticket.correlation_id, timeout=0)
+
+    late_response_envelope = coordinator.prepare_response(request_envelope, response)
+    coordinator.store_response(late_response_envelope)
+
+    assert coordinator._responses == {}
+
+
+def test_indefinite_wait_does_not_register_eviction() -> None:
+    coordinator = RequestResponseCoordinator()
+    request = RequestMessage(
+        message_type="billing.get_invoice",
+        payload={"invoice_id": "INV-1"},
+    )
+    response = ResponseMessage(
+        message_type="billing.get_invoice.response",
+        payload={"invoice_id": "INV-1", "total": 100},
+    )
+
+    request_envelope, ticket = coordinator.prepare_request(request, timeout=None)
+    response_envelope = coordinator.prepare_response(request_envelope, response)
+    coordinator.store_response(response_envelope)
+
+    received = coordinator.wait_for_response(ticket.correlation_id, timeout=None)
+
+    assert received.correlation_id == ticket.correlation_id
+    assert coordinator._responses == {}
