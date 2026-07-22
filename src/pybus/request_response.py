@@ -29,6 +29,7 @@ class RequestResponseCoordinator:
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._responses: dict[str, MessageEnvelope] = {}
+        self._deadlines: dict[str, datetime] = {}
 
     def prepare_request(
         self,
@@ -102,12 +103,30 @@ class RequestResponseCoordinator:
     def store_response(self, response_envelope: MessageEnvelope) -> None:
         if not response_envelope.correlation_id:
             raise ValueError("response envelope must include a correlation_id")
+        correlation_id = response_envelope.correlation_id
         with self._condition:
-            self._responses[response_envelope.correlation_id] = response_envelope
+            now = datetime.now(timezone.utc)
+            deadline = self._deadlines.get(correlation_id)
+            already_expired = deadline is not None and now >= deadline
+            self._evict_expired(now)
+            if already_expired:
+                return
+            self._responses[correlation_id] = response_envelope
             self._condition.notify_all()
+
+    def _evict_expired(self, now: datetime) -> None:
+        expired = [
+            correlation_id
+            for correlation_id, deadline in self._deadlines.items()
+            if now >= deadline
+        ]
+        for correlation_id in expired:
+            self._responses.pop(correlation_id, None)
+            self._deadlines.pop(correlation_id, None)
 
     def take_response(self, correlation_id: str) -> MessageEnvelope | None:
         with self._condition:
+            self._deadlines.pop(correlation_id, None)
             return self._responses.pop(correlation_id, None)
 
     def wait_for_response(
@@ -119,6 +138,8 @@ class RequestResponseCoordinator:
         deadline = None
         if timeout is not None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+            with self._condition:
+                self._deadlines[correlation_id] = deadline
 
         with self._condition:
             while correlation_id not in self._responses:
@@ -133,6 +154,7 @@ class RequestResponseCoordinator:
                     )
                 self._condition.wait(timeout=remaining)
 
+            self._deadlines.pop(correlation_id, None)
             return self._responses.pop(correlation_id)
 
 
