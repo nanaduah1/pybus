@@ -48,38 +48,104 @@ class RedisGenerateBill:
 class FakeRedisClient:
     def __init__(self) -> None:
         self.queues: dict[str, list[bytes]] = {}
+        self.hashes: dict[str, dict[str, bytes]] = {}
         self.values: dict[str, bytes] = {}
-        self.brpop_error: Exception | None = None
-        self.eval_error: Exception | None = None
+        self.blmove_error: Exception | None = None
+        self.lmove_error: Exception | None = None
+        self.lrem_error: Exception | None = None
+        self.hset_error: Exception | None = None
+        self.hdel_error: Exception | None = None
+        self.lpush_error: Exception | None = None
         self.get_error: Exception | None = None
         self.set_error: Exception | None = None
-        self.brpop_calls = 0
-        self.eval_calls = 0
+        self.blmove_calls = 0
+        self.lmove_calls = 0
 
     def lpush(self, channel: str, message: bytes) -> None:
+        if self.lpush_error is not None:
+            raise self.lpush_error
         self.queues.setdefault(channel, []).insert(0, message)
-
-    def brpop(self, channel: str, timeout: int = 5):
-        self.brpop_calls += 1
-        if self.brpop_error is not None:
-            raise self.brpop_error
-        queue = self.queues.get(channel, [])
-        if not queue:
-            return None
-        return channel, queue.pop()
 
     def llen(self, channel: str) -> int:
         return len(self.queues.get(channel, []))
 
-    def eval(self, script: str, key_count: int, channel: str, limit: int):
-        self.eval_calls += 1
-        if self.eval_error is not None:
-            raise self.eval_error
-        del script, key_count
-        queue = self.queues.get(channel, [])
-        claimed = queue[:limit]
-        self.queues[channel] = queue[limit:]
-        return claimed
+    def blmove(
+        self,
+        first_list: str,
+        second_list: str,
+        timeout: int,
+        src: str = "LEFT",
+        dest: str = "RIGHT",
+    ):
+        self.blmove_calls += 1
+        if self.blmove_error is not None:
+            raise self.blmove_error
+        return self._move(first_list, second_list, src, dest)
+
+    def lmove(
+        self,
+        first_list: str,
+        second_list: str,
+        src: str = "LEFT",
+        dest: str = "RIGHT",
+    ):
+        self.lmove_calls += 1
+        if self.lmove_error is not None:
+            raise self.lmove_error
+        return self._move(first_list, second_list, src, dest)
+
+    def _move(self, first_list: str, second_list: str, src: str, dest: str):
+        queue = self.queues.get(first_list, [])
+        if not queue:
+            return None
+        value = queue.pop() if src == "RIGHT" else queue.pop(0)
+        target = self.queues.setdefault(second_list, [])
+        if dest == "LEFT":
+            target.insert(0, value)
+        else:
+            target.append(value)
+        return value
+
+    def lrem(self, key: str, count: int, value: bytes) -> int:
+        if self.lrem_error is not None:
+            raise self.lrem_error
+        queue = self.queues.get(key, [])
+        limit = abs(count) if count != 0 else len(queue)
+        removed = 0
+        source = queue if count >= 0 else list(reversed(queue))
+        new_queue: list[bytes] = []
+        for item in source:
+            if item == value and removed < limit:
+                removed += 1
+                continue
+            new_queue.append(item)
+        if count < 0:
+            new_queue.reverse()
+        self.queues[key] = new_queue
+        return removed
+
+    def hset(self, key: str, field=None, value=None, mapping=None) -> None:
+        if self.hset_error is not None:
+            raise self.hset_error
+        h = self.hashes.setdefault(key, {})
+        if mapping:
+            h.update(mapping)
+        else:
+            h[field] = value
+
+    def hget(self, key: str, field: str):
+        return self.hashes.get(key, {}).get(field)
+
+    def hdel(self, key: str, *fields: str) -> int:
+        if self.hdel_error is not None:
+            raise self.hdel_error
+        h = self.hashes.get(key, {})
+        removed = 0
+        for field in fields:
+            if field in h:
+                del h[field]
+                removed += 1
+        return removed
 
     def get(self, key: str) -> bytes | None:
         if self.get_error is not None:
@@ -401,17 +467,17 @@ def test_redis_continuation_waits_before_publishing_to_declared_queue() -> None:
     assert transport.size(DEFAULT_SLOW_QUEUE_NAME) == 1
 
 
-def test_redis_worker_aborts_on_indeterminate_destructive_pop() -> None:
+def test_redis_worker_aborts_on_indeterminate_claim() -> None:
     client = FakeRedisClient()
     transport = RedisTransport(client=client)
     listener = Listener(transport=transport, serializer=JsonSerializer())
     transport.publish(DEFAULT_QUEUE_NAME, b"later-work")
-    client.brpop_error = ConnectionError("reply lost")
+    client.blmove_error = ConnectionError("reply lost")
 
-    with pytest.raises(IndeterminateDeliveryError, match="destructive-pop"):
+    with pytest.raises(IndeterminateDeliveryError, match="claim outcome"):
         Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
 
-    assert client.brpop_calls == 1
+    assert client.blmove_calls == 1
     assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
@@ -440,13 +506,13 @@ def test_redis_worker_aborts_on_indeterminate_batch_claim() -> None:
         ),
     )
     transport.publish(DEFAULT_QUEUE_NAME, b"later-work")
-    client.eval_error = ConnectionError("batch reply lost")
+    client.lmove_error = ConnectionError("batch reply lost")
 
     with pytest.raises(IndeterminateDeliveryError, match="batch consume"):
         Worker(listener, DEFAULT_QUEUE_NAME, error_delay=0).run()
 
-    assert client.eval_calls == 1
-    assert client.brpop_calls == 0
+    assert client.lmove_calls == 1
+    assert client.blmove_calls == 0
     assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
@@ -568,6 +634,204 @@ def test_redis_worker_dead_letters_malformed_message_and_continues() -> None:
     assert poison.message_type == "pybus.message.decode_failed"
     assert poison.headers == {"dead_lettered_from": DEFAULT_QUEUE_NAME}
     assert base64.b64decode(poison.payload["raw_message"]) == malformed
+
+
+def test_consume_moves_message_into_processing_list_not_destroying_it() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+
+    message = transport.consume("pybus.jobs")
+
+    assert message == b"payload"
+    assert client.queues["pybus.jobs"] == []
+    assert client.queues["pybus.jobs:processing"] == [b"payload"]
+
+
+def test_crash_before_ack_leaves_message_in_processing_list() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+
+    transport.consume("pybus.jobs")
+
+    # simulate a crash: nothing else happens, receipt is discarded
+    assert client.queues["pybus.jobs"] == []
+    assert client.queues["pybus.jobs:processing"] == [b"payload"]
+
+
+def test_ack_removes_claimed_entry_from_processing_list_and_claims_hash() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+
+    transport.ack(message.receipt)
+
+    assert client.queues["pybus.jobs:processing"] == []
+    assert client.queues["pybus.jobs"] == []
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
+
+
+def test_ack_on_unknown_receipt_is_a_noop() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+
+    transport.ack("not-a-real-receipt")
+    transport.ack('{"channel": "pybus.jobs", "claim_id": "does-not-exist"}')
+
+
+def test_ack_is_idempotent_on_already_settled_receipt() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+
+    transport.ack(message.receipt)
+    transport.ack(message.receipt)  # second ack is a no-op, not an error
+
+    assert client.queues["pybus.jobs:processing"] == []
+
+
+def test_nack_is_idempotent_on_already_settled_receipt() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+
+    transport.nack(message.receipt, requeue=True)
+    transport.nack(message.receipt, requeue=True)  # second nack is a no-op
+
+    assert client.queues["pybus.jobs"] == [b"payload"]
+    assert client.queues["pybus.jobs:processing"] == []
+
+
+def test_nack_with_requeue_moves_entry_back_to_source_list() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+
+    transport.nack(message.receipt, requeue=True)
+
+    assert client.queues["pybus.jobs"] == [b"payload"]
+    assert client.queues["pybus.jobs:processing"] == []
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
+
+
+def test_nack_without_requeue_drops_entry() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+
+    transport.nack(message.receipt, requeue=False)
+
+    assert client.queues["pybus.jobs"] == []
+    assert client.queues["pybus.jobs:processing"] == []
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
+
+
+def test_ack_removes_exactly_one_duplicate_payload() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"same-payload")
+    transport.publish("pybus.jobs", b"same-payload")
+
+    first = transport.consume("pybus.jobs")
+    second = transport.consume("pybus.jobs")
+    assert client.queues["pybus.jobs:processing"] == [b"same-payload", b"same-payload"]
+
+    transport.ack(first.receipt)
+
+    assert client.queues["pybus.jobs:processing"] == [b"same-payload"]
+    # the second claim is untouched and can still be settled independently
+    transport.ack(second.receipt)
+    assert client.queues["pybus.jobs:processing"] == []
+
+
+def test_consume_many_claims_up_to_limit_and_partial_ack_leaves_remainder() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    for i in range(3):
+        transport.publish("pybus.jobs", f"payload-{i}".encode())
+
+    claimed = transport.consume_many("pybus.jobs", limit=2)
+
+    assert len(claimed) == 2
+    assert client.queues["pybus.jobs"] == [b"payload-2"]
+    assert set(client.queues["pybus.jobs:processing"]) == {b"payload-0", b"payload-1"}
+
+    transport.ack(claimed[0].receipt)
+
+    # only one of the two claimed messages is settled; the other survives a crash
+    assert len(client.queues["pybus.jobs:processing"]) == 1
+
+
+def test_consume_many_stops_early_when_source_is_empty() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"only-one")
+
+    claimed = transport.consume_many("pybus.jobs", limit=5)
+
+    assert len(claimed) == 1
+    assert claimed[0] == b"only-one"
+
+
+def test_consume_raises_indeterminate_delivery_error_on_unknown_outcome() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    client.blmove_error = ConnectionError("connection dropped")
+
+    with pytest.raises(IndeterminateDeliveryError):
+        transport.consume("pybus.jobs")
+
+
+def test_consume_many_raises_indeterminate_delivery_error_on_unknown_outcome() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    client.lmove_error = ConnectionError("connection dropped")
+
+    with pytest.raises(IndeterminateDeliveryError):
+        transport.consume_many("pybus.jobs", limit=5)
+
+
+def test_consume_raises_indeterminate_delivery_error_on_claim_record_failure() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    client.hset_error = ConnectionError("connection dropped")
+
+    with pytest.raises(IndeterminateDeliveryError):
+        transport.consume("pybus.jobs")
+
+    # the message survived the failed claim-record write: still recoverable
+    assert client.queues["pybus.jobs:processing"] == [b"payload"]
+
+
+def test_ack_raises_indeterminate_delivery_error_on_unknown_outcome() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+    client.lrem_error = ConnectionError("connection dropped")
+
+    with pytest.raises(IndeterminateDeliveryError):
+        transport.ack(message.receipt)
+
+
+def test_nack_requeue_raises_indeterminate_delivery_error_on_unknown_outcome() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+    client.lpush_error = ConnectionError("connection dropped")
+
+    with pytest.raises(IndeterminateDeliveryError):
+        transport.nack(message.receipt, requeue=True)
 
 
 def test_decode_json_redis_payload_only_accepts_json() -> None:
