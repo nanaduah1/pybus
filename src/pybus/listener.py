@@ -377,7 +377,6 @@ class Listener:
                 )
 
         results: list[object] = []
-        continued = False
         for handler in handlers:
             spec = self._spec_for(handler)
             if self._should_delay(envelope, spec):
@@ -392,6 +391,9 @@ class Listener:
                 return _CLAIM_SETTLED
 
             if isinstance(result, ContinueProcessing):
+                # The claim is already settled (republished + acked) here, so any
+                # remaining handler for this event must not run against it: a
+                # later failure would republish/ack the same claim a second time.
                 self._continue_processing(
                     channel_name,
                     envelope,
@@ -403,9 +405,7 @@ class Listener:
                     ),
                     receipt=receipt,
                 )
-                continued = True
-                results.append(None)
-                continue
+                return _CLAIM_SETTLED
 
             if isinstance(result, (ScheduleNextOccurrence, EndRecurrence)) and (
                 envelope.message_kind != CommandMessage.message_kind or not is_durable
@@ -417,7 +417,7 @@ class Listener:
 
             results.append(result)
 
-        if command_max_retries is not None and not continued:
+        if command_max_retries is not None:
             if is_durable and self._durable_job_controller is not None:
                 outcome = self._command_delivery_outcome(
                     envelope,
@@ -458,9 +458,6 @@ class Listener:
                 max_retries=command_max_retries,
                 apply_durable=not is_durable,
             )
-
-        if continued:
-            return _CLAIM_SETTLED
 
         return results[0] if len(results) == 1 else results
 
