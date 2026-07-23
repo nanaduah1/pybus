@@ -49,6 +49,60 @@ class SettlementFailureTransport(MemoryTransport):
         super().publish(channel, message)
 
 
+class _Claimed(bytes):
+    """A minimal receipt-bearing payload, mirroring `ReceiptedMessage` without
+    pulling the optional redis integration into core tests."""
+
+    receipt: str
+
+    def __new__(cls, payload: bytes, receipt: str) -> "_Claimed":
+        instance = super().__new__(cls, payload)
+        instance.receipt = receipt
+        return instance
+
+
+class ClaimingTransport(MemoryTransport):
+    """A MemoryTransport that hands out receipts on consume and records
+    ack/nack/publish calls, so Listener's claim-settlement wiring can be
+    tested without a real claim-based transport."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_receipt = 0
+        self.ack_calls: list[str] = []
+        self.nack_calls: list[tuple[str, bool]] = []
+        self.calls: list[tuple[str, str]] = []
+        self.fail_channels: set[str] = set()
+
+    def publish(self, channel: str, message: bytes) -> None:
+        if channel in self.fail_channels:
+            raise ConnectionError(f"failed to publish to {channel}")
+        self.calls.append(("publish", channel))
+        super().publish(channel, message)
+
+    def consume(self, channel: str, timeout: int = 5) -> _Claimed | None:
+        payload = super().consume(channel, timeout=timeout)
+        if payload is None:
+            return None
+        return self._claim(payload)
+
+    def consume_many(self, channel: str, limit: int) -> list[_Claimed]:
+        payloads = super().consume_many(channel, limit)
+        return [self._claim(payload) for payload in payloads]
+
+    def _claim(self, payload: bytes) -> _Claimed:
+        self._next_receipt += 1
+        return _Claimed(payload, f"receipt-{self._next_receipt}")
+
+    def ack(self, receipt: str) -> None:
+        self.ack_calls.append(receipt)
+        self.calls.append(("ack", receipt))
+
+    def nack(self, receipt: str, *, requeue: bool = True) -> None:
+        self.nack_calls.append((receipt, requeue))
+        self.calls.append(("nack", receipt))
+
+
 class MutableClock:
     def __init__(self) -> None:
         self.current = datetime(2026, 7, 13, tzinfo=timezone.utc)
@@ -1128,3 +1182,340 @@ def test_listener_zero_delay_does_not_sleep() -> None:
 
     listener.listen_once(DEFAULT_QUEUE_NAME)
     assert sleep_calls == []
+
+
+def test_listener_acks_claim_after_plain_event_success() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    registry.register("event", "student.enrolled", lambda message: "ok")
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="student.enrolled", payload={"student_id": "S-1"}
+            ).to_envelope(message_id="msg-ack-1")
+        ),
+    )
+
+    result = listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert result == "ok"
+    assert transport.ack_calls == ["receipt-1"]
+    assert transport.nack_calls == []
+
+
+def test_listener_acks_original_claim_only_after_requeue_publish_succeeds() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1),
+    )
+
+    def handle_event(message: EventMessage) -> None:
+        raise RuntimeError("boom")
+
+    registry.register("event", "billing.fail", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="msg-retry-ack-1"
+            )
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert transport.ack_calls == ["receipt-1"]
+    assert transport.nack_calls == []
+    publish_index = transport.calls.index(("publish", DEFAULT_QUEUE_NAME))
+    ack_index = transport.calls.index(("ack", "receipt-1"))
+    assert publish_index < ack_index
+
+
+def test_listener_acks_two_separate_claims_across_fail_then_succeed_attempts() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1),
+    )
+    attempts = 0
+
+    def handle_event(message: EventMessage) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("boom")
+        return "ok"
+
+    registry.register("event", "billing.fail", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="msg-retry-ack-2"
+            )
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) == "ok"
+
+    assert transport.ack_calls == ["receipt-1", "receipt-2"]
+    assert transport.nack_calls == []
+
+
+def test_listener_acks_original_claim_only_after_dead_letter_publish_succeeds() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=0),
+    )
+
+    def handle_event(message: EventMessage) -> None:
+        raise RuntimeError("boom")
+
+    registry.register("event", "billing.fail", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="msg-dlq-ack-1"
+            )
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert transport.ack_calls == ["receipt-1"]
+    assert transport.nack_calls == []
+    publish_index = transport.calls.index(("publish", DEFAULT_FAILED_QUEUE_NAME))
+    ack_index = transport.calls.index(("ack", "receipt-1"))
+    assert publish_index < ack_index
+
+
+def test_listener_acks_buffered_claim_even_when_reentrant_flush_fails() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=30, retry_limit=0)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        raise RuntimeError("batch unavailable")
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+
+    seed_envelope = EventMessage(
+        message_type="audit.log", payload={"entry": "seed"}
+    ).to_envelope(message_id="seed-1")
+    transport.publish("batched:audit.log", serializer.dump(seed_envelope))
+
+    current_envelope = EventMessage(
+        message_type="audit.log", payload={"entry": "current"}
+    ).to_envelope(message_id="msg-buffer-fail")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(current_envelope))
+
+    transport.fail_channels.add(DEFAULT_FAILED_QUEUE_NAME)
+
+    with pytest.raises(IndeterminateDeliveryError, match="dead-letter publication"):
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    # The main-channel claim (the "current" message) was already durably
+    # buffered before the reentrant flush of the unrelated ready batch blew
+    # up, so it must be acked even though listen_once ultimately raises.
+    assert transport.ack_calls == ["receipt-1"]
+
+
+def test_listener_acks_every_batch_member_receipt_on_success() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    handled: list[str] = []
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=30)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        handled.extend(message.payload["entry"] for message in messages)
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    for entry in ("one", "two"):
+        transport.publish(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="audit.log", payload={"entry": entry}
+                ).to_envelope()
+            ),
+        )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert handled == ["one", "two"]
+    # receipt-1/2 are the main-channel claims acked as each message is
+    # buffered; receipt-3/4 are the buffer-channel claims acked once the
+    # batch handler succeeds.
+    assert transport.ack_calls == ["receipt-1", "receipt-2", "receipt-3", "receipt-4"]
+    assert transport.nack_calls == []
+
+
+def test_listener_settles_each_batch_member_individually_with_own_receipt() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=0, retry_limit=2)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        raise RuntimeError(messages[0].message_type)
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    for message_id, retries in (("retryable", 1), ("exhausted", 2)):
+        envelope = EventMessage(
+            message_type="audit.log",
+            payload={"entry": message_id},
+            headers={"retries": retries},
+        ).to_envelope(message_id=message_id)
+        transport.publish("batched:audit.log", serializer.dump(envelope))
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert transport.ack_calls == ["receipt-1", "receipt-2"]
+    assert transport.nack_calls == []
+    retry_publish_index = transport.calls.index(("publish", "batched:audit.log"))
+    dead_letter_publish_index = transport.calls.index(
+        ("publish", DEFAULT_FAILED_QUEUE_NAME)
+    )
+    assert transport.calls.index(("ack", "receipt-1")) > retry_publish_index
+    assert transport.calls.index(("ack", "receipt-2")) > dead_letter_publish_index
+
+
+def test_listener_acks_undecodable_batch_member_and_valid_sibling_receipt() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    handled: list[str] = []
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=0)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        handled.extend(message.payload["entry"] for message in messages)
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    valid = serializer.dump(
+        EventMessage(message_type="audit.log", payload={"entry": "valid"}).to_envelope(
+            message_id="valid-msg"
+        )
+    )
+    malformed = b"not-json"
+    transport.publish("batched:audit.log", valid)
+    transport.publish("batched:audit.log", malformed)
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert handled == ["valid"]
+    assert set(transport.ack_calls) == {"receipt-1", "receipt-2"}
+    assert transport.nack_calls == []
+
+
+def test_listener_does_not_ack_claim_when_retry_requeue_publish_is_indeterminate() -> (
+    None
+):
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1),
+    )
+    registry.register(
+        "event",
+        "billing.fail",
+        lambda message: (_ for _ in ()).throw(RuntimeError("handler failed")),
+    )
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="msg-indeterminate-retry"
+            )
+        ),
+    )
+    transport.fail_channels.add(DEFAULT_QUEUE_NAME)
+
+    with pytest.raises(IndeterminateDeliveryError, match="retry requeue"):
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert transport.ack_calls == []
+    assert transport.nack_calls == []
+
+
+def test_listener_does_not_ack_claim_when_dead_letter_publish_is_indeterminate() -> (
+    None
+):
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=0),
+    )
+    registry.register(
+        "event",
+        "billing.fail",
+        lambda message: (_ for _ in ()).throw(RuntimeError("handler failed")),
+    )
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="msg-indeterminate-dlq"
+            )
+        ),
+    )
+    transport.fail_channels.add(DEFAULT_FAILED_QUEUE_NAME)
+
+    with pytest.raises(IndeterminateDeliveryError, match="dead-letter publication"):
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert transport.ack_calls == []
+    assert transport.nack_calls == []

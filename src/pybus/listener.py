@@ -53,6 +53,15 @@ class _Unset:
 _UNSET = _Unset()
 
 
+class _ClaimSettled:
+    """Sentinel `_dispatch` returns when it already acked the claim itself
+    (retry, dead-letter, continuation, or batch buffering), so `listen_once`
+    doesn't redundantly ack the same claim again."""
+
+
+_CLAIM_SETTLED = _ClaimSettled()
+
+
 class Listener:
     def __init__(
         self,
@@ -105,40 +114,58 @@ class Listener:
         active_channels = self._active_channels(channel)
         if not active_channels:
             return None
-        channel_name, envelope = self._consume_envelope(active_channels)
+        channel_name, envelope, receipt = self._consume_envelope(active_channels)
         if envelope is None:
             return None
 
-        self._verify_durable_configuration(channel_name, envelope)
+        self._verify_durable_configuration(channel_name, envelope, receipt=receipt)
 
         try:
-            result = self._dispatch(channel_name, envelope)
+            result = self._dispatch(channel_name, envelope, receipt=receipt)
         except (IndeterminateDeliveryError, WorkerAbortError):
             raise
         except HandlerNotFoundError:
             self._dead_letter(
-                channel_name, envelope, max_retries=self.retry_policy.max_retries
+                channel_name,
+                envelope,
+                max_retries=self.retry_policy.max_retries,
+                receipt=receipt,
             )
             return None
         except Exception:
             if self._should_retry(envelope):
                 self._requeue(
-                    channel_name, envelope, max_retries=self.retry_policy.max_retries
+                    channel_name,
+                    envelope,
+                    max_retries=self.retry_policy.max_retries,
+                    receipt=receipt,
                 )
             else:
                 self._dead_letter(
-                    channel_name, envelope, max_retries=self.retry_policy.max_retries
+                    channel_name,
+                    envelope,
+                    max_retries=self.retry_policy.max_retries,
+                    receipt=receipt,
                 )
+            return None
+
+        if result is _CLAIM_SETTLED:
             return None
 
         if envelope.message_kind == RequestMessage.message_kind and isinstance(
             result, ResponseMessage
         ):
-            self._publish_response(envelope, result)
+            self._publish_response(envelope, result, receipt=receipt)
+        else:
+            self._ack_claim(receipt)
         return result
 
     def _verify_durable_configuration(
-        self, channel_name: str, envelope: MessageEnvelope
+        self,
+        channel_name: str,
+        envelope: MessageEnvelope,
+        *,
+        receipt: str | None = None,
     ) -> None:
         try:
             identity = DurableJobController.identity(envelope)
@@ -149,6 +176,7 @@ class Listener:
                 reason="durable job metadata is invalid",
                 error_type=WorkerAbortError,
                 cause=exc,
+                receipt=receipt,
             )
         if identity is not None and self._durable_job_controller is None:
             self._restore_claimed_command_and_abort(
@@ -156,6 +184,7 @@ class Listener:
                 envelope,
                 reason="durable job store is not configured on this worker",
                 error_type=WorkerAbortError,
+                receipt=receipt,
             )
         if (
             identity is not None
@@ -166,6 +195,7 @@ class Listener:
                 envelope,
                 reason="durable delivery metadata is valid only on commands",
                 error_type=WorkerAbortError,
+                receipt=receipt,
             )
 
     def _admit_durable_delivery(
@@ -174,6 +204,7 @@ class Listener:
         envelope: MessageEnvelope,
         *,
         max_retries: int,
+        receipt: str | None = None,
     ) -> bool:
         if self._durable_job_controller is None:
             return True
@@ -191,6 +222,7 @@ class Listener:
                 reason="durable job admission failed",
                 error_type=WorkerAbortError,
                 cause=exc,
+                receipt=receipt,
             )
         if decision is None or decision == DurableDeliveryDecision.PROCEED:
             return True
@@ -201,6 +233,7 @@ class Listener:
             envelope,
             reason="durable job admission could not be verified",
             error_type=WorkerAbortError,
+            receipt=receipt,
         )
         return False
 
@@ -230,22 +263,31 @@ class Listener:
 
     def _consume_envelope(
         self, channel: str | Sequence[str]
-    ) -> tuple[str | None, MessageEnvelope | None]:
+    ) -> tuple[str | None, MessageEnvelope | None, str | None]:
         channels = (channel,) if isinstance(channel, str) else tuple(channel)
         consume_timeout = 5 if len(channels) == 1 else MULTI_QUEUE_CONSUME_TIMEOUT
         for channel_name in channels:
             raw_message = self.transport.consume(channel_name, timeout=consume_timeout)
             if raw_message is None:
                 continue
+            receipt = getattr(raw_message, "receipt", None)
             try:
                 envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))
             except Exception as exc:
-                self._dead_letter_undecodable(channel_name, raw_message, exc)
-                return channel_name, None
-            return channel_name, envelope
-        return None, None
+                self._dead_letter_undecodable(
+                    channel_name, raw_message, exc, receipt=receipt
+                )
+                return channel_name, None, None
+            return channel_name, envelope, receipt
+        return None, None, None
 
-    def _dispatch(self, channel_name: str, envelope: MessageEnvelope) -> object | None:
+    def _dispatch(
+        self,
+        channel_name: str,
+        envelope: MessageEnvelope,
+        *,
+        receipt: str | None = None,
+    ) -> object | None:
         handlers = self.dispatcher.registry.handlers_for(
             envelope.message_kind,
             envelope.message_type,
@@ -260,6 +302,7 @@ class Listener:
                     envelope,
                     reason="durable jobs require exactly one command handler",
                     error_type=WorkerAbortError,
+                    receipt=receipt,
                 )
             command_max_retries = self.retry_policy.max_retries
             if handlers:
@@ -270,6 +313,7 @@ class Listener:
                 channel_name,
                 envelope,
                 max_retries=command_max_retries,
+                receipt=receipt,
             ):
                 return None
 
@@ -282,9 +326,11 @@ class Listener:
         message = self.dispatcher.decode(envelope)
 
         if self._has_batched_handlers(handlers):
-            self._buffer_batched_message(message.message_type, envelope)
+            self._buffer_batched_message(
+                message.message_type, envelope, receipt=receipt
+            )
             self._flush_ready_batches()
-            return None
+            return _CLAIM_SETTLED
 
         if envelope.message_kind == CommandMessage.message_kind and (
             self._command_delivery_observers or is_durable
@@ -295,6 +341,7 @@ class Listener:
                     envelope,
                     reason="command delivery outcomes require exactly one handler",
                     error_type=WorkerAbortError,
+                    receipt=receipt,
                 )
             if command_max_retries is None:
                 command_spec = self._spec_for(handlers[0])
@@ -326,6 +373,7 @@ class Listener:
                     reason="command delivery start observation failed",
                     error_type=DeliveryObservationError,
                     cause=exc,
+                    receipt=receipt,
                 )
 
         results: list[object] = []
@@ -338,8 +386,10 @@ class Listener:
             try:
                 result = handler(message)
             except Exception:
-                self._handle_failed_delivery(channel_name, envelope, spec)
-                return None
+                self._handle_failed_delivery(
+                    channel_name, envelope, spec, receipt=receipt
+                )
+                return _CLAIM_SETTLED
 
             if isinstance(result, ContinueProcessing):
                 self._continue_processing(
@@ -351,6 +401,7 @@ class Listener:
                         if spec.retry_limit is None
                         else spec.retry_limit
                     ),
+                    receipt=receipt,
                 )
                 continued = True
                 results.append(None)
@@ -359,8 +410,10 @@ class Listener:
             if isinstance(result, (ScheduleNextOccurrence, EndRecurrence)) and (
                 envelope.message_kind != CommandMessage.message_kind or not is_durable
             ):
-                self._handle_failed_delivery(channel_name, envelope, spec)
-                return None
+                self._handle_failed_delivery(
+                    channel_name, envelope, spec, receipt=receipt
+                )
+                return _CLAIM_SETTLED
 
             results.append(result)
 
@@ -385,8 +438,9 @@ class Listener:
                         channel_name,
                         envelope,
                         self._spec_for(handlers[0]),
+                        receipt=receipt,
                     )
-                    return None
+                    return _CLAIM_SETTLED
                 except Exception as exc:
                     self._logger.exception(
                         "Durable job success settlement failed for %s",
@@ -404,6 +458,9 @@ class Listener:
                 max_retries=command_max_retries,
                 apply_durable=not is_durable,
             )
+
+        if continued:
+            return _CLAIM_SETTLED
 
         return results[0] if len(results) == 1 else results
 
@@ -432,6 +489,8 @@ class Listener:
         channel_name: str,
         envelope: MessageEnvelope,
         spec: HandlerSpec,
+        *,
+        receipt: str | None = None,
     ) -> None:
         max_retries = (
             self.retry_policy.max_retries
@@ -441,9 +500,13 @@ class Listener:
         if self._retry_count(envelope) < max_retries:
             if spec.delay > 0:
                 time.sleep(spec.delay)
-            self._requeue(channel_name, envelope, max_retries=max_retries)
+            self._requeue(
+                channel_name, envelope, max_retries=max_retries, receipt=receipt
+            )
             return
-        self._dead_letter(channel_name, envelope, max_retries=max_retries)
+        self._dead_letter(
+            channel_name, envelope, max_retries=max_retries, receipt=receipt
+        )
 
     def _continue_processing(
         self,
@@ -452,6 +515,7 @@ class Listener:
         continuation: ContinueProcessing,
         *,
         max_retries: int,
+        receipt: str | None = None,
     ) -> None:
         target_queue = continuation.queue or channel_name
         if target_queue == self.dead_letter_channel:
@@ -477,6 +541,7 @@ class Listener:
             destination_queue=target_queue,
             retry_count=self._retry_count(envelope),
             max_retries=max_retries,
+            receipt=receipt,
         )
         self._settle_after_claim(
             "continuation",
@@ -484,6 +549,7 @@ class Listener:
                 target_queue, self.serializer.dump(envelope)
             ),
         )
+        self._ack_claim(receipt)
         self._notify_command_outcome(
             envelope,
             status=CommandDeliveryStatus.CONTINUED,
@@ -533,6 +599,8 @@ class Listener:
         self,
         message_type: str,
         envelope: MessageEnvelope,
+        *,
+        receipt: str | None = None,
     ) -> None:
         if not hasattr(self.transport, "size"):
             return
@@ -543,6 +611,7 @@ class Listener:
             "batch buffering",
             lambda: self.transport.publish(buffer_key, self.serializer.dump(envelope)),
         )
+        self._ack_claim(receipt)
 
     def _flush_batch(
         self,
@@ -556,15 +625,20 @@ class Listener:
             return
 
         envelopes: list[MessageEnvelope] = []
+        receipts: list[str | None] = []
         events: list[object] = []
         for raw_message in raw_messages:
+            receipt = getattr(raw_message, "receipt", None)
             try:
                 envelope = MessageEnvelope.from_dict(self.serializer.loads(raw_message))
                 event = self.dispatcher.decode(envelope)
             except Exception as exc:
-                self._dead_letter_undecodable(buffer_key, raw_message, exc)
+                self._dead_letter_undecodable(
+                    buffer_key, raw_message, exc, receipt=receipt
+                )
                 continue
             envelopes.append(envelope)
+            receipts.append(receipt)
             events.append(event)
 
         if not events:
@@ -575,17 +649,21 @@ class Listener:
             handler(events)
         except Exception:
             requeued = False
-            for envelope in envelopes:
+            for envelope, receipt in zip(envelopes, receipts):
                 max_retries = (
                     self.retry_policy.max_retries
                     if spec.retry_limit is None
                     else spec.retry_limit
                 )
                 if self._retry_count(envelope) < max_retries:
-                    self._requeue(buffer_key, envelope, max_retries=max_retries)
+                    self._requeue(
+                        buffer_key, envelope, max_retries=max_retries, receipt=receipt
+                    )
                     requeued = True
                 else:
-                    self._dead_letter(buffer_key, envelope, max_retries=max_retries)
+                    self._dead_letter(
+                        buffer_key, envelope, max_retries=max_retries, receipt=receipt
+                    )
             if requeued:
                 self._batch_retry_after[message_type] = self._now_fn() + timedelta(
                     seconds=spec.max_wait
@@ -594,6 +672,8 @@ class Listener:
                 self._batch_retry_after.pop(message_type, None)
             return
 
+        for receipt in receipts:
+            self._ack_claim(receipt)
         self._batch_started_at.pop(message_type, None)
         self._batch_retry_after.pop(message_type, None)
 
@@ -619,6 +699,7 @@ class Listener:
         envelope: MessageEnvelope,
         *,
         max_retries: int,
+        receipt: str | None = None,
     ) -> None:
         # Blocks the listener for the configured delay. On multi-channel listeners
         # this stalls all channels for the duration; keep delay values small.
@@ -646,6 +727,7 @@ class Listener:
             retry_count=retries + 1,
             max_retries=max_retries,
             last_attempt_at=now,
+            receipt=receipt,
         )
         self._settle_after_claim(
             "retry requeue",
@@ -670,6 +752,7 @@ class Listener:
                 ),
             ),
         )
+        self._ack_claim(receipt)
         self._notify_command_outcome(
             envelope,
             status=CommandDeliveryStatus.RETRY_SCHEDULED,
@@ -685,6 +768,7 @@ class Listener:
         envelope: MessageEnvelope,
         *,
         max_retries: int,
+        receipt: str | None = None,
     ) -> None:
         headers = dict(envelope.headers)
         headers["dead_lettered_from"] = channel_name
@@ -695,6 +779,7 @@ class Listener:
             destination_queue=self.dead_letter_channel,
             retry_count=self._retry_count(envelope),
             max_retries=max_retries,
+            receipt=receipt,
         )
         self._settle_after_claim(
             "dead-letter publication",
@@ -719,6 +804,7 @@ class Listener:
                 ),
             ),
         )
+        self._ack_claim(receipt)
         self._notify_command_outcome(
             envelope,
             status=CommandDeliveryStatus.DEAD_LETTERED,
@@ -810,6 +896,7 @@ class Listener:
         retry_count: int,
         max_retries: int,
         last_attempt_at: datetime | None = None,
+        receipt: str | None = None,
     ) -> None:
         if self._durable_job_controller is None:
             return
@@ -830,6 +917,7 @@ class Listener:
                 reason="durable job settlement checkpoint failed",
                 error_type=WorkerAbortError,
                 cause=exc,
+                receipt=receipt,
             )
 
     def _restore_claimed_command_and_abort(
@@ -840,6 +928,7 @@ class Listener:
         reason: str,
         error_type: type[WorkerAbortError],
         cause: Exception | None = None,
+        receipt: str | None = None,
     ) -> None:
         self._settle_after_claim(
             "command claim recovery",
@@ -848,6 +937,7 @@ class Listener:
                 self.serializer.dump(envelope),
             ),
         )
+        self._ack_claim(receipt)
         error = error_type(
             f"{reason}; the unchanged command was restored before handler execution"
         )
@@ -860,6 +950,8 @@ class Listener:
         channel_name: str,
         raw_message: bytes | str,
         exception: Exception,
+        *,
+        receipt: str | None = None,
     ) -> None:
         raw_bytes = (
             raw_message.encode("utf-8") if isinstance(raw_message, str) else raw_message
@@ -881,11 +973,14 @@ class Listener:
                 self.dead_letter_channel, self.serializer.dump(poison)
             ),
         )
+        self._ack_claim(receipt)
 
     def _publish_response(
         self,
         request_envelope: MessageEnvelope,
         response: ResponseMessage,
+        *,
+        receipt: str | None = None,
     ) -> None:
         def publish_response() -> None:
             reply_queue = request_envelope.reply_to or DEFAULT_REPLY_QUEUE
@@ -908,6 +1003,7 @@ class Listener:
             self.transport.publish(reply_queue, self.serializer.dump(response_envelope))
 
         self._settle_after_claim("response publication", publish_response)
+        self._ack_claim(receipt)
 
     def _settle_after_claim(
         self,
@@ -921,4 +1017,16 @@ class Listener:
         except Exception as exc:
             raise IndeterminateDeliveryError(
                 f"{action} failed after a message was claimed from the transport"
+            ) from exc
+
+    def _ack_claim(self, receipt: str | None) -> None:
+        if receipt is None:
+            return
+        try:
+            self.transport.ack(receipt)
+        except IndeterminateDeliveryError:
+            raise
+        except Exception as exc:
+            raise IndeterminateDeliveryError(
+                "claim ack failed after a message outcome was durably published"
             ) from exc

@@ -501,6 +501,57 @@ def test_stale_or_terminal_delivery_is_consumed_without_running_handler() -> Non
     assert transport.size(DEFAULT_QUEUE_NAME) == 0
 
 
+class _Claimed(bytes):
+    receipt: str
+
+    def __new__(cls, payload: bytes, receipt: str) -> "_Claimed":
+        instance = super().__new__(cls, payload)
+        instance.receipt = receipt
+        return instance
+
+
+class ClaimingTransport(MemoryTransport):
+    """A MemoryTransport that hands out receipts on consume and records ack
+    calls, so a durable-admission DROP decision can be verified to settle the
+    claim rather than silently leaving it unacked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_receipt = 0
+        self.ack_calls: list[str] = []
+
+    def consume(self, channel: str, timeout: int = 5) -> _Claimed | None:
+        payload = super().consume(channel, timeout=timeout)
+        if payload is None:
+            return None
+        self._next_receipt += 1
+        return _Claimed(payload, f"receipt-{self._next_receipt}")
+
+    def ack(self, receipt: str) -> None:
+        self.ack_calls.append(receipt)
+
+
+def test_stale_or_terminal_delivery_acks_the_claimed_message() -> None:
+    handled = []
+
+    @command_handler(GenerateBill)
+    def handle(message: GenerateBill) -> None:
+        handled.append(message)
+
+    store = RecordingDurableStore()
+    store.admission = DurableDeliveryDecision.DROP
+    transport = ClaimingTransport()
+    bus = Pybus(transport, durable_job_store=store, handler_targets=[handle])
+    bus.schedule_command(GenerateBill(student_id=13))
+    bus.create_durable_job_worker(error_delay=0).run(max_iterations=1)
+
+    acks_before_drop = len(transport.ack_calls)
+    assert bus.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert handled == []
+    assert len(transport.ack_calls) == acks_before_drop + 1
+
+
 def test_stale_delivery_is_dropped_before_typed_payload_decoding() -> None:
     handled = []
 
