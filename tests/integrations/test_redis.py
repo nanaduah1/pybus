@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import pickle
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -20,8 +21,11 @@ from pybus.envelope import MessageEnvelope
 from pybus.handlers import ContinueProcessing, batched_event_handler, event_handler
 from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
 from pybus.integrations.redis import (
+    RedisReaperPolicy,
+    RedisReaperRunner,
     RedisScheduleStateStore,
     RedisTransport,
+    create_redis_reaper_worker,
     decode_json_redis_payload,
     decode_legacy_redis_payload,
     decode_trusted_legacy_redis_payload,
@@ -50,6 +54,7 @@ class FakeRedisClient:
         self.queues: dict[str, list[bytes]] = {}
         self.hashes: dict[str, dict[str, bytes]] = {}
         self.values: dict[str, bytes] = {}
+        self.sorted_sets: dict[str, dict[str, float]] = {}
         self.blmove_error: Exception | None = None
         self.lmove_error: Exception | None = None
         self.lrem_error: Exception | None = None
@@ -58,6 +63,8 @@ class FakeRedisClient:
         self.lpush_error: Exception | None = None
         self.get_error: Exception | None = None
         self.set_error: Exception | None = None
+        self.zadd_error: Exception | None = None
+        self.zrem_error: Exception | None = None
         self.blmove_calls = 0
         self.lmove_calls = 0
 
@@ -156,6 +163,89 @@ class FakeRedisClient:
         if self.set_error is not None:
             raise self.set_error
         self.values[key] = value.encode("utf-8")
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        if self.zadd_error is not None:
+            raise self.zadd_error
+        zset = self.sorted_sets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in zset:
+                added += 1
+            zset[member] = float(score)
+        return added
+
+    def zrangebyscore(
+        self,
+        key: str,
+        min: float | str,
+        max: float | str,
+        start: int | None = None,
+        num: int | None = None,
+    ) -> list[str]:
+        zset = self.sorted_sets.get(key, {})
+        lo = float(min)
+        hi = float(max)
+        members = [
+            member
+            for member, score in sorted(zset.items(), key=lambda item: item[1])
+            if lo <= score <= hi
+        ]
+        if start is None and num is None:
+            return members
+        offset = start or 0
+        return members[offset : offset + num] if num is not None else members[offset:]
+
+    def zrem(self, key: str, *members: str) -> int:
+        if self.zrem_error is not None:
+            raise self.zrem_error
+        zset = self.sorted_sets.get(key, {})
+        removed = 0
+        for member in members:
+            if member in zset:
+                del zset[member]
+                removed += 1
+        return removed
+
+    def pipeline(self, transaction: bool = True) -> "_FakePipeline":
+        return _FakePipeline(self)
+
+
+class _FakePipeline:
+    """Queues commands and applies them (via the real client methods, so
+    existing per-op error injectors still fire) on `execute()`. Doesn't model
+    real MULTI/EXEC abort semantics — only proves the code issues one
+    pipelined round-trip instead of sequential calls."""
+
+    def __init__(self, client: FakeRedisClient) -> None:
+        self._client = client
+        self._ops: list[tuple[str, tuple, dict]] = []
+
+    def hset(self, *args, **kwargs) -> "_FakePipeline":
+        self._ops.append(("hset", args, kwargs))
+        return self
+
+    def zadd(self, *args, **kwargs) -> "_FakePipeline":
+        self._ops.append(("zadd", args, kwargs))
+        return self
+
+    def lrem(self, *args, **kwargs) -> "_FakePipeline":
+        self._ops.append(("lrem", args, kwargs))
+        return self
+
+    def hdel(self, *args, **kwargs) -> "_FakePipeline":
+        self._ops.append(("hdel", args, kwargs))
+        return self
+
+    def zrem(self, *args, **kwargs) -> "_FakePipeline":
+        self._ops.append(("zrem", args, kwargs))
+        return self
+
+    def execute(self) -> list:
+        ops, self._ops = self._ops, []
+        return [
+            getattr(self._client, name)(*args, **kwargs) for name, args, kwargs in ops
+        ]
 
 
 class PermissiveDurableStore:
@@ -812,12 +902,36 @@ def test_consume_raises_indeterminate_delivery_error_on_claim_record_failure() -
     assert client.queues["pybus.jobs:processing"] == [b"payload"]
 
 
+def test_consume_raises_indeterminate_delivery_error_on_index_write_failure() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    client.zadd_error = ConnectionError("connection dropped")
+
+    with pytest.raises(IndeterminateDeliveryError):
+        transport.consume("pybus.jobs")
+
+    # the message survived the failed index write: still recoverable
+    assert client.queues["pybus.jobs:processing"] == [b"payload"]
+
+
 def test_ack_raises_indeterminate_delivery_error_on_unknown_outcome() -> None:
     client = FakeRedisClient()
     transport = RedisTransport(client=client)
     transport.publish("pybus.jobs", b"payload")
     message = transport.consume("pybus.jobs")
     client.lrem_error = ConnectionError("connection dropped")
+
+    with pytest.raises(IndeterminateDeliveryError):
+        transport.ack(message.receipt)
+
+
+def test_ack_raises_indeterminate_delivery_error_on_index_removal_failure() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    message = transport.consume("pybus.jobs")
+    client.zrem_error = ConnectionError("connection dropped")
 
     with pytest.raises(IndeterminateDeliveryError):
         transport.ack(message.receipt)
@@ -1075,3 +1189,285 @@ def test_legacy_redis_decoders_handle_json_and_pickle(
     decoder, payload: bytes, expected: dict[str, object]
 ) -> None:
     assert decoder(payload) == expected
+
+
+def _backdate_claim(client: FakeRedisClient, channel: str, *, age: timedelta) -> None:
+    """Simulate a claim aged past a visibility timeout by rewriting its index
+    score directly, since `FakeRedisClient` claims always use the real clock."""
+    index_key = f"{channel}:claims:index"
+    zset = client.sorted_sets.get(index_key, {})
+    cutoff = (datetime.now(timezone.utc) - age).timestamp()
+    for claim_id in zset:
+        zset[claim_id] = cutoff
+
+
+def test_stale_claims_ignores_claims_younger_than_cutoff() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    transport.consume("pybus.jobs")
+
+    stale = transport.stale_claims(
+        "pybus.jobs", older_than=datetime.now(timezone.utc) - timedelta(minutes=5)
+    )
+
+    assert stale == []
+
+
+def test_stale_claims_finds_claims_older_than_cutoff() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    transport.consume("pybus.jobs")
+
+    stale = transport.stale_claims(
+        "pybus.jobs", older_than=datetime.now(timezone.utc) + timedelta(seconds=1)
+    )
+
+    assert [bytes(message) for message in stale] == [b"payload"]
+
+
+def test_stale_claims_respects_limit() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    for i in range(3):
+        transport.publish("pybus.jobs", f"payload-{i}".encode())
+        transport.consume("pybus.jobs")
+
+    stale = transport.stale_claims(
+        "pybus.jobs",
+        older_than=datetime.now(timezone.utc) + timedelta(seconds=1),
+        limit=2,
+    )
+
+    assert len(stale) == 2
+
+
+def test_stale_claims_self_heals_orphaned_index_entry() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    transport.publish("pybus.jobs", b"payload")
+    transport.consume("pybus.jobs")
+    # simulate an orphaned index entry: hash cleared directly, index left behind
+    client.hashes["pybus.jobs:claims"] = {}
+    assert client.sorted_sets["pybus.jobs:claims:index"] != {}
+
+    stale = transport.stale_claims(
+        "pybus.jobs", older_than=datetime.now(timezone.utc) + timedelta(seconds=1)
+    )
+
+    assert stale == []
+    assert client.sorted_sets["pybus.jobs:claims:index"] == {}
+
+
+def test_redis_reaper_policy_rejects_non_positive_visibility_timeout() -> None:
+    with pytest.raises(ValueError, match="visibility_timeout"):
+        RedisReaperPolicy(visibility_timeout=timedelta(0))
+
+
+def test_redis_reaper_policy_rejects_invalid_max_reclaim_attempts() -> None:
+    with pytest.raises(ValueError, match="max_reclaim_attempts"):
+        RedisReaperPolicy(max_reclaim_attempts=-1)
+
+
+def test_redis_reaper_runner_requires_at_least_one_channel() -> None:
+    transport = RedisTransport(client=FakeRedisClient())
+
+    with pytest.raises(ValueError, match="at least one channel"):
+        RedisReaperRunner(transport, [])
+
+
+def test_redis_reaper_runner_rejects_dead_letter_channel_among_reaped_channels() -> (
+    None
+):
+    transport = RedisTransport(client=FakeRedisClient())
+
+    with pytest.raises(ValueError, match="dead-letter channel"):
+        RedisReaperRunner(
+            transport,
+            [DEFAULT_FAILED_QUEUE_NAME],
+            dead_letter_channel=DEFAULT_FAILED_QUEUE_NAME,
+        )
+
+
+def test_reaper_redelivers_stale_claim_with_incremented_retries() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    envelope = EventMessage(
+        message_type="billing.stale", payload={"id": 1}
+    ).to_envelope(message_id="reaper-1")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+    transport.consume(DEFAULT_QUEUE_NAME)
+    _backdate_claim(client, DEFAULT_QUEUE_NAME, age=timedelta(minutes=10))
+
+    runner = RedisReaperRunner(
+        transport,
+        [DEFAULT_QUEUE_NAME],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        serializer=serializer,
+    )
+
+    assert runner.run_once() == 1
+    assert client.queues[f"{DEFAULT_QUEUE_NAME}:processing"] == []
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+    assert client.sorted_sets.get(f"{DEFAULT_QUEUE_NAME}:claims:index", {}) == {}
+    redelivered = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_QUEUE_NAME))
+    )
+    assert redelivered.message_id == "reaper-1"
+    assert redelivered.headers["retries"] == 1
+    assert "last_attempt" in redelivered.headers
+
+
+def test_reaper_leaves_fresh_claim_untouched() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    envelope = EventMessage(
+        message_type="billing.fresh", payload={"id": 1}
+    ).to_envelope(message_id="reaper-fresh")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+    transport.consume(DEFAULT_QUEUE_NAME)
+
+    runner = RedisReaperRunner(
+        transport,
+        [DEFAULT_QUEUE_NAME],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        serializer=serializer,
+    )
+
+    assert runner.run_once() == 0
+    assert len(client.queues[f"{DEFAULT_QUEUE_NAME}:processing"]) == 1
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) != {}
+
+
+def test_reaper_dead_letters_claim_past_reclaim_attempt_bound() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    envelope = EventMessage(
+        message_type="billing.poison", payload={"id": 1}, headers={"retries": 5}
+    ).to_envelope(message_id="reaper-poison")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+    transport.consume(DEFAULT_QUEUE_NAME)
+    _backdate_claim(client, DEFAULT_QUEUE_NAME, age=timedelta(minutes=10))
+
+    runner = RedisReaperRunner(
+        transport,
+        [DEFAULT_QUEUE_NAME],
+        dead_letter_channel=DEFAULT_FAILED_QUEUE_NAME,
+        policy=RedisReaperPolicy(
+            visibility_timeout=timedelta(minutes=5), max_reclaim_attempts=5
+        ),
+        serializer=serializer,
+    )
+
+    assert runner.run_once() == 1
+    assert transport.size(DEFAULT_QUEUE_NAME) == 0
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+    dead_lettered = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_FAILED_QUEUE_NAME))
+    )
+    assert dead_lettered.message_id == "reaper-poison"
+    assert dead_lettered.headers["dead_lettered_from"] == DEFAULT_QUEUE_NAME
+    assert dead_lettered.headers["retries"] == 5
+
+
+def test_reaper_dead_letters_undecodable_stale_payload() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    transport.publish(DEFAULT_QUEUE_NAME, b"not-json")
+    transport.consume(DEFAULT_QUEUE_NAME)
+    _backdate_claim(client, DEFAULT_QUEUE_NAME, age=timedelta(minutes=10))
+
+    runner = RedisReaperRunner(
+        transport,
+        [DEFAULT_QUEUE_NAME],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        serializer=serializer,
+    )
+
+    assert runner.run_once() == 1
+    assert transport.size(DEFAULT_QUEUE_NAME) == 0
+    poison = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_FAILED_QUEUE_NAME))
+    )
+    assert poison.message_type == "pybus.message.decode_failed"
+    assert poison.headers == {"dead_lettered_from": DEFAULT_QUEUE_NAME}
+    assert base64.b64decode(poison.payload["raw_message"]) == b"not-json"
+
+
+def test_reaper_raises_and_leaves_claim_recoverable_when_ack_is_indeterminate() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    envelope = EventMessage(
+        message_type="billing.stale", payload={"id": 1}
+    ).to_envelope(message_id="reaper-ack-indeterminate")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+    transport.consume(DEFAULT_QUEUE_NAME)
+    _backdate_claim(client, DEFAULT_QUEUE_NAME, age=timedelta(minutes=10))
+
+    runner = RedisReaperRunner(
+        transport,
+        [DEFAULT_QUEUE_NAME],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        serializer=serializer,
+    )
+    # The redelivered copy publishes fine; only settling (acking) the old claim
+    # fails — this must surface as IndeterminateDeliveryError, not be swallowed,
+    # and must leave the old claim in place so a later sweep can still recover it.
+    client.lrem_error = ConnectionError("ack lost")
+
+    with pytest.raises(IndeterminateDeliveryError, match="claim settlement failed"):
+        runner.run_once()
+
+    # publish-then-ack ordering: the redelivered copy already landed...
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+    # ...and the old claim is untouched (settle failed before removing anything),
+    # so it remains recoverable rather than lost.
+    assert len(client.queues[f"{DEFAULT_QUEUE_NAME}:processing"]) == 1
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) != {}
+    assert client.sorted_sets.get(f"{DEFAULT_QUEUE_NAME}:claims:index", {}) != {}
+
+
+def test_create_redis_reaper_worker_uses_distinct_sentinel_channels() -> None:
+    transport = RedisTransport(client=FakeRedisClient())
+
+    worker = create_redis_reaper_worker(transport, [DEFAULT_QUEUE_NAME])
+
+    assert worker.channel == "__pybus_redis_reaper__"
+    assert worker.listener.dead_letter_channel == "__pybus_redis_reaper_terminal__"
+    assert worker.listener.dead_letter_channel != worker.channel
+
+
+def test_create_redis_reaper_worker_redelivers_via_worker_run() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    envelope = EventMessage(
+        message_type="billing.stale", payload={"id": 1}
+    ).to_envelope(message_id="reaper-worker-1")
+    transport.publish(DEFAULT_QUEUE_NAME, serializer.dump(envelope))
+    transport.consume(DEFAULT_QUEUE_NAME)
+    _backdate_claim(client, DEFAULT_QUEUE_NAME, age=timedelta(minutes=10))
+
+    worker = create_redis_reaper_worker(
+        transport,
+        [DEFAULT_QUEUE_NAME],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        serializer=serializer,
+        error_delay=0,
+        idle_delay=0,
+    )
+
+    worker.run(max_iterations=1)
+
+    redelivered = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_QUEUE_NAME))
+    )
+    assert redelivered.message_id == "reaper-worker-1"
+    assert redelivered.headers["retries"] == 1
