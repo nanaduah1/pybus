@@ -166,6 +166,31 @@ transport track, not to the base envelope model.
 | Scheduler state | Process-local or bare-name timestamp | Versioned identity-keyed state with restart-safe backoff |
 | Request/response | Not present | New capability, no legacy breakage |
 
+### 4.1 Redis claim/ack transport
+
+`RedisTransport` claims via `blmove`/`lmove` into a per-channel processing list
+and settles via `ack`/`nack`, recovered on crash by `RedisReaperRunner` once the
+claim is durably indexed — satisfying ADR-004's compatibility consequence that
+Redis behavior remain compatible with current queues. (The move and the
+claim-index write are two separate steps; a crash or indeterminate failure
+between them leaves a payload the reaper cannot yet discover — tracked as
+[pybus#57](https://github.com/nanaduah1/pybus/issues/57).) Producer- and
+monitoring-side behavior is unchanged:
+
+- `publish()` still does a plain `LPUSH` on the channel key — no wire-shape or
+  producer-version change.
+- `size()` still reports `LLEN` on the channel key for the source list only;
+  claimed-but-unsettled entries sit in `<channel>:processing` and are not
+  counted, matching the prior destructive-pop behavior where a claimed message
+  was likewise no longer visible to `size()`.
+
+Only consumer-side claim mechanics differ. Operators will now see three new
+per-channel keys once a consumer claims work: `<channel>:processing` (a list —
+the claimed-but-unsettled entries), `<channel>:claims` (a hash of claim
+metadata), and `<channel>:claims:index` (a sorted set the reaper scans for
+stale claims). These are additive; nothing about the existing `<channel>` list
+itself changes shape.
+
 ---
 
 ## 5. Non-Breaking Migration Rule
@@ -206,8 +231,8 @@ feel familiar while the core repo stays focused on the new public contracts.
 
 Prepared publication and command delivery observers are additive native APIs.
 They do not change legacy handlers or payloads. Observers are process-local,
-metadata-only reconciliation signals and do not strengthen the destructive-pop
-transport into exactly-once or crash-safe delivery.
+metadata-only reconciliation signals and do not strengthen the transport's own
+delivery guarantee (see §4.1) into exactly-once delivery.
 
 Durable timing and recurrence are likewise additive. Existing
 `schedule_command(command, idempotency_key=...)` calls keep their immediate

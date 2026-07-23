@@ -212,15 +212,24 @@ Each worker receives fresh hook instances. An explicit `hooks=` argument on
 The Django `BusConfiguration` import supplies connection cleanup by default;
 the core import remains framework-neutral.
 
-Known pre-claim polling errors are recoverable. Redis destructive-pop errors,
-and settlement encoding or publication failures after consumption, raise
-`IndeterminateDeliveryError` and abort the worker so later messages are not
-drained through the same outage. An indeterminate batch claim can affect every
-member already removed by that claim.
+Known pre-claim polling errors are recoverable. Redis claim errors (a failed
+`blmove`/`lmove`), and settlement encoding or publication failures after
+consumption, raise `IndeterminateDeliveryError` and abort the worker so later
+messages are not drained through the same outage. An indeterminate batch claim
+can affect every member already removed by that claim.
 
-The current Redis list transport provides bounded handler retries during a
-running process, but it does not yet provide claim/ack crash recovery. A crash
-or indeterminate publication outcome can still lose the claimed message even
-though the worker fails closed. Consumers that require crash-safe at-least-once
-delivery must wait for or provide the durability track rather than infer that
-guarantee from `Worker`.
+The Redis transport provides crash-safe at-least-once delivery once a claim is
+durably indexed: `consume()` claims into a per-channel processing list instead
+of popping destructively, and `ack`/`nack` settle that claim. A worker crash or
+an indeterminate publication outcome after claim leaves the message in the
+processing list rather than losing it — `RedisReaperRunner`/`create_redis_reaper_worker`
+periodically finds claims older than `RedisReaperPolicy.visibility_timeout` and
+redelivers or dead-letters them. The claim move and the claim-index write are
+two separate steps; a crash or indeterminate failure in that narrow window
+between them leaves the payload in the processing list with no index entry,
+which the reaper cannot yet discover — a known, tracked gap (see
+[pybus#57](https://github.com/nanaduah1/pybus/issues/57)). This is the
+raw-transport guarantee `Worker` runs on; the separate durable-job/outbox layer
+adds its own storage-backed persistence and reconciliation on top for
+applications that need a durable job record, not just durable transport
+delivery.

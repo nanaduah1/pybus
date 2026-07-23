@@ -298,3 +298,35 @@ Before switching a feature, confirm:
 - the handler is idempotent
 - the failure path still routes correctly
 - test coverage exists for the migration path
+
+---
+
+## 10. Redis claim/ack transport upgrade
+
+`RedisTransport` moved from a destructive-pop `consume()` to claiming into a
+per-channel processing list, settled via `ack`/`nack` and recovered on crash by
+`RedisReaperRunner` once a claim is durably indexed. See
+`docs/compatibility-contract.md` §4.1 for the full behavioral detail, including
+the narrow gap this doesn't yet cover; this section covers the upgrade
+boundary for a running deployment.
+
+- **Nothing to reclaim on first upgrade.** A pre-upgrade deployment has no
+  `<channel>:processing`, `<channel>:claims`, or `<channel>:claims:index` keys,
+  so a freshly started reaper finds no stale claims — there is no backlog to
+  migrate.
+- **Producer/consumer version skew is safe.** `publish()` is still a plain
+  `LPUSH`; an old producer and a new (claim/ack) consumer, or the reverse,
+  interoperate on the same list without any coordinated rollout order.
+- **Run consumers before (or alongside) the reaper.** The reaper only recovers
+  claims that its own consumer version created; deploy the claim/ack consumer
+  first, then start `create_redis_reaper_worker()` for its channels once
+  workers are on the new transport.
+- **A rolling deploy with old and new consumers running concurrently is safe,
+  but only new-version consumers are crash-safe.** Old (`brpop`) and new
+  (`blmove`) consumers both atomically pop from the same list end, so they
+  interoperate as ordinary competing consumers — a message goes to whichever
+  wins the pop, exactly as when scaling any consumer pool. A crash in an
+  old-version worker after its pop is still an unrecovered loss, same as
+  before this change; a crash in a new-version worker is recovered by the
+  reaper. Finish rolling every consumer of a channel onto the new transport
+  before relying on the reaper as that channel's crash-safety net.

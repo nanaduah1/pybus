@@ -366,11 +366,15 @@ consume retry budget.
 
 Continuation delay is synchronous pacing, not durable scheduling. The pause
 occupies the worker, is not cooperatively interruptible, delays every other
-queue assigned to that worker, and lengthens the destructive-claim window before
-republication. Use it only for short cooldowns on isolated workers. The default
-zero preserves immediate continuation for compatibility and does not itself
-prevent a hot loop; applications must select a positive delay where a pass may
-make no progress and must keep a separate termination or stall policy.
+queue assigned to that worker, and lengthens the window the message stays
+claimed before republication. On a transport with claim/reaper support (see
+`RedisTransport`), a crash during that window leaves the claim recoverable —
+the reaper redelivers or dead-letters it once it goes stale — rather than
+losing it outright; a transport without reaper support can still lose it. Use
+it only for short cooldowns on isolated workers. The default zero preserves
+immediate continuation for compatibility and does not itself prevent a hot
+loop; applications must select a positive delay where a pass may make no
+progress and must keep a separate termination or stall policy.
 
 Typed handlers receive the domain message rather than its envelope. During
 migration, handlers that require transport headers or correlation metadata may
@@ -728,29 +732,41 @@ the delivery that already completed. A failed `before_poll` skips consumption
 for that cycle.
 
 Known pre-claim polling and lifecycle errors are recoverable cycle failures. A
-Redis destructive-pop exception has an unknown server-side claim outcome and is
-therefore indeterminate. If a retry, dead-letter, poison record, continuation,
-batch buffer, or response cannot be encoded or published after a message was
-claimed, the listener also raises `IndeterminateDeliveryError`. The worker
-reports that error to hooks and then aborts instead of consuming later messages.
+Redis claim exception (a failed `blmove`/`lmove`) has an unknown server-side
+claim outcome and is therefore indeterminate. If a retry, dead-letter, poison
+record, continuation, batch buffer, or response cannot be encoded or published
+after a message was claimed, the listener also raises
+`IndeterminateDeliveryError`. The worker reports that error to hooks and then
+aborts instead of consuming later messages.
 
 `WorkerAbortError` also stops the worker after hooks observe a known state that
 requires operator action. `DeliveryObservationError` is its delivery-observer
 subclass. These errors do not imply unknown transport settlement;
-`IndeterminateDeliveryError` remains reserved for destructive claim or
-settlement outcomes that cannot be known.
+`IndeterminateDeliveryError` remains reserved for claim or settlement outcomes
+that cannot be known.
 
 The optional `DjangoConnectionCleanupHook` lazily imports Django and runs
 `close_old_connections()` before and after each poll and again at shutdown.
 The core package remains importable without Django installed.
 
-The worker does not own or disconnect its transport. Current list transports
-consume with a destructive pop, so a process crash or indeterminate transport
-failure after claim can still lose claimed work. Failing closed prevents the
-worker from draining later queues but cannot restore the claimed item. A batch
-claim may leave multiple already-popped members indeterminate. A future
-claim/ack transport is required for a crash-safe at-least-once guarantee; this
-lifecycle API does not imply one.
+The worker does not own or disconnect its transport. `RedisTransport` claims
+into a per-channel processing list rather than popping destructively, so once a
+claim is durably indexed, a process crash after claim does not by itself lose
+the message: it stays in `<channel>:processing` until `RedisReaperRunner` (see
+`create_redis_reaper_worker`) reclaims stale claims and redelivers or
+dead-letters them, bounded by `RedisReaperPolicy`. An indeterminate transport
+failure after claim (e.g. a settlement or publish that cannot be confirmed)
+still makes the worker fail closed for that cycle — failing closed avoids
+draining later queues on top of an unresolved claim, and the reaper is what
+ultimately recovers or terminates that claim rather than the worker retrying it
+inline. The claim itself is written in two steps (move into the processing
+list, then a separate index write); a crash or indeterminate failure in that
+narrow window leaves the payload in the processing list with no index entry,
+which the reaper cannot yet discover — a known, tracked gap (see [pybus#57](https://github.com/nanaduah1/pybus/issues/57)),
+not a case this guarantee currently covers. This is the raw-transport delivery
+guarantee; it is separate from the durable-job/outbox persistence layer
+(§4.2), which adds its own storage-backed lease and reconciliation on top of
+whatever transport publishes the prepared command.
 
 The topology should preserve these declared defaults:
 
