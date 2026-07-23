@@ -238,6 +238,61 @@ def test_listener_requeues_continuation_on_same_queue() -> None:
     assert transport.size(DEFAULT_QUEUE_NAME) == 1
 
 
+def test_continuation_short_circuits_remaining_handlers_on_subsequent_failure() -> None:
+    transport = ClaimingTransport()
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1),
+    )
+    second_handler_calls: list[str] = []
+
+    @event_handler("billing.chunked")
+    def continue_handler(message: EventMessage) -> ContinueProcessing:
+        return ContinueProcessing()
+
+    @event_handler("billing.chunked")
+    def failing_handler(message: EventMessage) -> None:
+        second_handler_calls.append(message.payload["batch_id"])
+        raise RuntimeError("boom")
+
+    registry.register("event", "billing.chunked", continue_handler)
+    registry.register("event", "billing.chunked", failing_handler)
+
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="billing.chunked",
+                payload={"batch_id": "B-multi"},
+            ).to_envelope(message_id="msg-multi")
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    # The second handler must never run against a claim the first handler's
+    # continuation already settled, and the claim must be republished/acked
+    # exactly once -- not once for the continuation and again for a retry
+    # or dead-letter triggered by the second handler's failure.
+    assert second_handler_calls == []
+    assert transport.ack_calls == ["receipt-1"]
+    assert transport.nack_calls == []
+    publish_calls = [call for call in transport.calls if call[0] == "publish"]
+    # One publish is the test's own seed of the original message; the other
+    # is the continuation's republish. A duplicate retry/dead-letter publish
+    # from the second handler's failure would make this three.
+    assert publish_calls == [
+        ("publish", DEFAULT_QUEUE_NAME),
+        ("publish", DEFAULT_QUEUE_NAME),
+    ]
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 0
+
+
 def test_listener_waits_before_republishing_paced_continuation() -> None:
     transport = MemoryTransport()
     serializer = JsonSerializer()
