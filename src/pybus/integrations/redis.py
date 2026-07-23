@@ -93,6 +93,16 @@ class RedisTransport:
     duplicate payloads are queued. A per-channel claims index (a sorted set,
     `<channel>:claims:index`, scored by claim time) lets a reaper find stale
     claims via `stale_claims()` without scanning claim payloads.
+
+    Delivery guarantee: crash-safe at-least-once once a claim is durably
+    indexed. A claim that outlives its worker is not lost — `RedisReaperRunner`
+    (via `create_redis_reaper_worker`) finds it through `stale_claims()` and
+    redelivers or dead-letters it. The move into the processing list and the
+    claim-index write are two separate steps; a crash (or a raised exception
+    from the index write) between them leaves the payload in the processing
+    list with no index entry, which `stale_claims()` cannot discover — a known,
+    tracked gap (see https://github.com/nanaduah1/pybus/issues/57), not a case
+    this guarantee currently covers.
     """
 
     def __init__(

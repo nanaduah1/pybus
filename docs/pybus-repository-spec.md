@@ -216,6 +216,12 @@ That means:
 - handlers must be idempotent or guarded by an inbox
 - duplicates must be expected, not treated as exceptional
 
+The Redis reference transport realizes this guarantee once a claim is durably
+indexed: `RedisTransport` claims into a per-channel processing list and settles
+via `ack`/`nack`, with `RedisReaperRunner` recovering claims a crashed worker
+left unsettled. See `docs/compatibility-contract.md` §4.1 for the wire-level
+detail and the narrow gap this guarantee doesn't yet cover.
+
 ### 6.2 Outbox
 
 The outbox is the mechanism for durable publication.

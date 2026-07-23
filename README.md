@@ -342,11 +342,13 @@ def handle_chunk(message) -> ContinueProcessing:
 The optional delay is a short synchronous worker pause before Pybus republishes
 the unchanged envelope. It is capped at 60 seconds and is intended to prevent
 tight workflow loops on an isolated worker. It is not durable future scheduling:
-the worker cannot stop during the pause, other queues assigned to that worker
-also wait, and a process crash before republication can lose the destructively
-claimed message. Use the scheduler or transport-specific delayed delivery for
-long waits. The backward-compatible default delay is zero, so applications that
-can make no progress must opt into a positive value and retain their own loop
+the worker cannot stop during the pause, and other queues assigned to that
+worker also wait. On the Redis transport, a process crash before republication
+leaves the message claimed rather than losing it — the reaper redelivers or
+dead-letters it once the claim goes stale. Use the scheduler or
+transport-specific delayed delivery for long waits. The backward-compatible
+default delay is zero, so applications that can make no progress must opt into
+a positive value and retain their own loop
 termination or stall ceiling.
 
 ## Scheduled tasks
