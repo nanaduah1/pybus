@@ -834,6 +834,224 @@ def test_nack_requeue_raises_indeterminate_delivery_error_on_unknown_outcome() -
         transport.nack(message.receipt, requeue=True)
 
 
+def test_redis_listener_acks_plain_success_clears_processing_and_claims() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    registry.register("event", "student.enrolled", lambda message: "ok")
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(
+                message_type="student.enrolled", payload={"student_id": "S-1"}
+            ).to_envelope(message_id="redis-ack-1")
+        ),
+    )
+
+    result = listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert result == "ok"
+    assert client.queues[f"{DEFAULT_QUEUE_NAME}:processing"] == []
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+
+
+def test_redis_listener_acks_original_claim_after_retry_requeue() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=1),
+    )
+
+    def handle_event(message: EventMessage) -> None:
+        raise RuntimeError("boom")
+
+    registry.register("event", "billing.fail", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="redis-retry-1"
+            )
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert client.queues[f"{DEFAULT_QUEUE_NAME}:processing"] == []
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+    assert transport.size(DEFAULT_QUEUE_NAME) == 1
+    retried = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_QUEUE_NAME))
+    )
+    assert retried.headers["retries"] == 1
+
+
+def test_redis_listener_acks_original_claim_after_dead_letter_publish() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=0),
+    )
+
+    def handle_event(message: EventMessage) -> None:
+        raise RuntimeError("boom")
+
+    registry.register("event", "billing.fail", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="redis-dlq-1"
+            )
+        ),
+    )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert client.queues[f"{DEFAULT_QUEUE_NAME}:processing"] == []
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+
+
+def test_redis_listener_acks_every_batch_member_claim_on_success() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    handled: list[str] = []
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=30)
+    def handle_batch(messages: list[EventMessage]) -> None:
+        handled.extend(message.payload["entry"] for message in messages)
+
+    registry.register("event", "audit.log", handle_batch, allow_multiple=True)
+    for entry in ("one", "two"):
+        transport.publish(
+            DEFAULT_QUEUE_NAME,
+            serializer.dump(
+                EventMessage(
+                    message_type="audit.log", payload={"entry": entry}
+                ).to_envelope()
+            ),
+        )
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert handled == ["one", "two"]
+    assert client.queues[f"{DEFAULT_QUEUE_NAME}:processing"] == []
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+    assert client.queues["batched:audit.log:processing"] == []
+    assert client.hashes.get("batched:audit.log:claims", {}) == {}
+
+
+def test_redis_listener_settles_batch_partial_failure_per_member_claim() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+
+    @batched_event_handler("audit.log", batch_size=2, max_wait=0, retry_limit=2)
+    def fail_batch(messages: list[EventMessage]) -> None:
+        raise RuntimeError(messages[0].message_type)
+
+    registry.register("event", "audit.log", fail_batch, allow_multiple=True)
+    for message_id, retries in (("retryable", 1), ("exhausted", 2)):
+        envelope = EventMessage(
+            message_type="audit.log",
+            payload={"entry": message_id},
+            headers={"retries": retries},
+        ).to_envelope(message_id=message_id)
+        transport.publish("batched:audit.log", serializer.dump(envelope))
+
+    listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert client.queues["batched:audit.log:processing"] == []
+    assert client.hashes.get("batched:audit.log:claims", {}) == {}
+    assert transport.size("batched:audit.log") == 1
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+
+
+def test_redis_listener_acks_claim_for_undecodable_message() -> None:
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+    )
+    transport.publish(DEFAULT_QUEUE_NAME, b"not-json")
+
+    assert listener.listen_once(DEFAULT_QUEUE_NAME) is None
+
+    assert client.queues[f"{DEFAULT_QUEUE_NAME}:processing"] == []
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+    assert transport.size(DEFAULT_FAILED_QUEUE_NAME) == 1
+
+
+def test_redis_listener_leaves_claim_untouched_when_dead_letter_publish_is_indeterminate() -> (
+    None
+):
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    registry = Registry()
+    listener = Listener(
+        transport=transport,
+        dispatcher=Dispatcher(registry=registry, serializer=serializer),
+        serializer=serializer,
+        retry_policy=RetryPolicy(max_retries=0),
+    )
+
+    def handle_event(message: EventMessage) -> None:
+        raise RuntimeError("boom")
+
+    registry.register("event", "billing.fail", handle_event)
+    transport.publish(
+        DEFAULT_QUEUE_NAME,
+        serializer.dump(
+            EventMessage(message_type="billing.fail", payload={"id": 1}).to_envelope(
+                message_id="redis-indeterminate-1"
+            )
+        ),
+    )
+    client.lpush_error = ConnectionError("dead letter publish lost")
+
+    with pytest.raises(IndeterminateDeliveryError, match="dead-letter publication"):
+        listener.listen_once(DEFAULT_QUEUE_NAME)
+
+    assert len(client.queues[f"{DEFAULT_QUEUE_NAME}:processing"]) == 1
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) != {}
+
+
 def test_decode_json_redis_payload_only_accepts_json() -> None:
     assert decode_json_redis_payload(JsonSerializer().dump({"hello": "world"})) == {
         "hello": "world"
