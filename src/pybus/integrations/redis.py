@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import math
 import pickle
-from datetime import datetime, timezone
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from importlib import import_module
+from threading import Event
 from typing import Any
 from uuid import uuid4
 
+from pybus.envelope import MessageEnvelope
 from pybus.exceptions import DeserializationError, IndeterminateDeliveryError
+from pybus.queues import DEFAULT_FAILED_QUEUE_NAME
+from pybus.retries import resolve_retry_count
 from pybus.serializer import JsonSerializer
+from pybus.worker import Worker, WorkerHook
 
 
 def _client_from_url(url: str | None, *, component: str) -> Any:
@@ -80,7 +90,9 @@ class RedisTransport:
     between claim and `ack`/`nack` leaves the message recoverable. A per-channel
     claims hash (`<channel>:claims`) tracks which processing-list entry belongs to
     which claim, so `ack`/`nack` can settle exactly one claimed entry even when
-    duplicate payloads are queued.
+    duplicate payloads are queued. A per-channel claims index (a sorted set,
+    `<channel>:claims:index`, scored by claim time) lets a reaper find stale
+    claims via `stale_claims()` without scanning claim payloads.
     """
 
     def __init__(
@@ -166,17 +178,21 @@ class RedisTransport:
 
     def _claim(self, channel: str, payload: bytes) -> ReceiptedMessage:
         claim_id = uuid4().hex
-        # claimed_at has no reader yet; it's for epic #44's slice #50 (stale-claim
-        # reaper) to age out abandoned claims without a schema change.
-        claimed_at = datetime.now(timezone.utc).isoformat()
+        claimed_at_dt = datetime.now(timezone.utc)
         try:
-            self._client.hset(
+            pipeline = self._client.pipeline(transaction=True)
+            pipeline.hset(
                 self._claims_key(channel),
                 mapping={
                     self._payload_field(claim_id): payload,
-                    self._claimed_at_field(claim_id): claimed_at,
+                    self._claimed_at_field(claim_id): claimed_at_dt.isoformat(),
                 },
             )
+            pipeline.zadd(
+                self._claims_index_key(channel),
+                {claim_id: claimed_at_dt.timestamp()},
+            )
+            pipeline.execute()
         except Exception as exc:
             raise IndeterminateDeliveryError(
                 f"Redis claim record failed with an unknown outcome for {channel!r}"
@@ -203,22 +219,56 @@ class RedisTransport:
 
     def _settle_claim(self, channel: str, claim_id: str, payload: bytes) -> None:
         try:
-            self._client.lrem(self._processing_key(channel), 1, payload)
-        except Exception as exc:
-            raise IndeterminateDeliveryError(
-                f"Redis claim settlement failed with an unknown outcome for {channel!r}"
-            ) from exc
-        try:
-            self._client.hdel(
+            pipeline = self._client.pipeline(transaction=True)
+            pipeline.lrem(self._processing_key(channel), 1, payload)
+            pipeline.hdel(
                 self._claims_key(channel),
                 self._payload_field(claim_id),
                 self._claimed_at_field(claim_id),
             )
+            pipeline.zrem(self._claims_index_key(channel), claim_id)
+            pipeline.execute()
         except Exception as exc:
             raise IndeterminateDeliveryError(
-                "Redis claim record cleanup failed with an unknown outcome "
-                f"for {channel!r}"
+                f"Redis claim settlement failed with an unknown outcome for {channel!r}"
             ) from exc
+
+    def stale_claims(
+        self, channel: str, *, older_than: datetime, limit: int = 100
+    ) -> list[ReceiptedMessage]:
+        """Return up to `limit` claimed messages whose claim predates `older_than`.
+
+        Read-only: nothing is moved, requeued, or removed. The caller (a reaper)
+        decides the outcome of each stale claim and settles it via `ack`/`publish`.
+        """
+        claim_ids = self._client.zrangebyscore(
+            self._claims_index_key(channel),
+            "-inf",
+            older_than.timestamp(),
+            start=0,
+            num=limit,
+        )
+        stale: list[ReceiptedMessage] = []
+        for raw_claim_id in claim_ids:
+            claim_id = (
+                raw_claim_id.decode("utf-8")
+                if isinstance(raw_claim_id, bytes)
+                else raw_claim_id
+            )
+            payload = self._client.hget(
+                self._claims_key(channel), self._payload_field(claim_id)
+            )
+            if payload is None:
+                # Orphaned index entry — e.g. a concurrent ack/nack settled this
+                # claim (removing hash + index together) between our zrangebyscore
+                # read and this hget. Self-heal so it isn't rescanned forever.
+                self._client.zrem(self._claims_index_key(channel), claim_id)
+                continue
+            receipt = json.dumps(
+                {"channel": channel, "claim_id": claim_id}, separators=(",", ":")
+            )
+            stale.append(ReceiptedMessage(payload, receipt))
+        return stale
 
     @staticmethod
     def _parse_receipt(receipt: str) -> tuple[str, str] | None:
@@ -243,12 +293,249 @@ class RedisTransport:
         return f"{channel}:claims"
 
     @staticmethod
+    def _claims_index_key(channel: str) -> str:
+        return f"{channel}:claims:index"
+
+    @staticmethod
     def _payload_field(claim_id: str) -> str:
         return f"{claim_id}:payload"
 
     @staticmethod
     def _claimed_at_field(claim_id: str) -> str:
         return f"{claim_id}:claimed_at"
+
+
+@dataclass(frozen=True)
+class RedisReaperPolicy:
+    """Bounds for reclaiming stale Redis claims.
+
+    Not threaded through `BusConfiguration`/`Pybus` — both are transport-agnostic
+    and must stay import-safe without `redis`, so Redis-reaper wiring lives
+    entirely in this integration module instead.
+    """
+
+    visibility_timeout: timedelta = timedelta(minutes=5)
+    max_reclaim_attempts: int = 5
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.visibility_timeout, timedelta) or (
+            self.visibility_timeout <= timedelta(0)
+        ):
+            raise ValueError("visibility_timeout must be a positive timedelta")
+        if (
+            isinstance(self.max_reclaim_attempts, bool)
+            or not isinstance(self.max_reclaim_attempts, int)
+            or self.max_reclaim_attempts < 0
+        ):
+            raise ValueError("max_reclaim_attempts must be a non-negative integer")
+
+
+class RedisReaperRunner:
+    """Reclaims stale Redis claims: redelivers them, or dead-letters them once
+    reclaimed too many times, using the same `retries`/`last_attempt` header
+    convention `Listener` uses so poison messages still terminate through the
+    existing dead-letter path."""
+
+    def __init__(
+        self,
+        transport: RedisTransport,
+        channels: Sequence[str],
+        *,
+        dead_letter_channel: str = DEFAULT_FAILED_QUEUE_NAME,
+        policy: RedisReaperPolicy | None = None,
+        serializer: JsonSerializer | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+        batch_limit: int = 100,
+    ) -> None:
+        channels = tuple(channels)
+        if not channels:
+            raise ValueError("reaper requires at least one channel")
+        if dead_letter_channel in channels:
+            raise ValueError("dead-letter channel is terminal and cannot be reaped")
+        self.transport = transport
+        self.channels = channels
+        self.dead_letter_channel = dead_letter_channel
+        self.policy = policy or RedisReaperPolicy()
+        self.serializer = serializer or JsonSerializer()
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self.batch_limit = batch_limit
+        self._logger = logging.getLogger("pybus.redis_reaper")
+
+    def run_once(self) -> int:
+        cutoff = self._now_fn() - self.policy.visibility_timeout
+        reclaimed = 0
+        for channel in self.channels:
+            stale = self.transport.stale_claims(
+                channel, older_than=cutoff, limit=self.batch_limit
+            )
+            for message in stale:
+                self._reclaim(channel, message)
+                reclaimed += 1
+        return reclaimed
+
+    def _reclaim(self, channel: str, message: ReceiptedMessage) -> None:
+        try:
+            envelope = MessageEnvelope.from_dict(self.serializer.loads(message))
+        except Exception as exc:
+            self._logger.warning(
+                "Stale claim on %r could not be decoded: %s", channel, exc
+            )
+            self._dead_letter_undecodable(channel, message)
+            return
+
+        # No dispatcher/registry is available here, so unlike `Listener._retry_count`
+        # this never reads `envelope.payload` — a domain payload could legitimately
+        # have its own field named "retries" unrelated to framework bookkeeping.
+        retries = resolve_retry_count(None, envelope.headers)
+        headers = dict(envelope.headers)
+        now = self._now_fn()
+        if retries >= self.policy.max_reclaim_attempts:
+            headers["dead_lettered_from"] = channel
+            target = self.dead_letter_channel
+        else:
+            headers["retries"] = retries + 1
+            headers["last_attempt"] = now.isoformat()
+            target = channel
+
+        self._settle_after_claim(
+            "stale-claim reclaim",
+            lambda: self.transport.publish(
+                target,
+                self.serializer.dump(
+                    MessageEnvelope.create(
+                        message_id=envelope.message_id,
+                        message_type=envelope.message_type,
+                        message_kind=envelope.message_kind,
+                        version=envelope.version,
+                        payload=envelope.payload,
+                        headers=headers,
+                        created_at=envelope.created_at,
+                        correlation_id=envelope.correlation_id,
+                        causation_id=envelope.causation_id,
+                        reply_to=envelope.reply_to,
+                        expires_at=envelope.expires_at,
+                        content_type=envelope.content_type,
+                        content_encoding=envelope.content_encoding,
+                    )
+                ),
+            ),
+        )
+        self._ack_claim(message.receipt)
+
+    def _dead_letter_undecodable(self, channel: str, message: ReceiptedMessage) -> None:
+        raw_bytes = bytes(message)
+        poison = MessageEnvelope.create(
+            message_type="pybus.message.decode_failed",
+            message_kind="event",
+            version=1,
+            payload={
+                "raw_message": base64.b64encode(raw_bytes).decode("ascii"),
+                "raw_message_encoding": "base64",
+                "error_type": "ReaperDecodeError",
+            },
+            headers={"dead_lettered_from": channel},
+        )
+        self._settle_after_claim(
+            "stale-claim decode-failure publication",
+            lambda: self.transport.publish(
+                self.dead_letter_channel, self.serializer.dump(poison)
+            ),
+        )
+        self._ack_claim(message.receipt)
+
+    def _settle_after_claim(self, action: str, operation: Callable[[], None]) -> None:
+        try:
+            operation()
+        except IndeterminateDeliveryError:
+            raise
+        except Exception as exc:
+            raise IndeterminateDeliveryError(
+                f"{action} failed after a stale claim was reclaimed from the transport"
+            ) from exc
+
+    def _ack_claim(self, receipt: str) -> None:
+        try:
+            self.transport.ack(receipt)
+        except IndeterminateDeliveryError:
+            raise
+        except Exception as exc:
+            raise IndeterminateDeliveryError(
+                "stale claim ack failed after a reclaim outcome was durably published"
+            ) from exc
+
+
+class RedisReaperPoller:
+    """Adapt a `RedisReaperRunner` to the regular `Worker` lifecycle."""
+
+    dead_letter_channel = "__pybus_redis_reaper_terminal__"
+
+    def __init__(
+        self,
+        runner: RedisReaperRunner,
+        *,
+        idle_delay: float = 1.0,
+        stop_event: Event | None = None,
+    ) -> None:
+        if (
+            isinstance(idle_delay, bool)
+            or not isinstance(idle_delay, (int, float))
+            or not math.isfinite(idle_delay)
+            or idle_delay < 0
+        ):
+            raise ValueError("idle_delay must be a non-negative finite number")
+        self.runner = runner
+        self.idle_delay = float(idle_delay)
+        self.stop_event = stop_event or Event()
+
+    def listen_once(self, channel: str | tuple[str, ...]) -> object | None:
+        reclaimed = self.runner.run_once()
+        if reclaimed == 0:
+            self.stop_event.wait(self.idle_delay)
+            return None
+        return reclaimed
+
+
+def create_redis_reaper_worker(
+    transport: RedisTransport,
+    channels: Sequence[str],
+    *,
+    dead_letter_channel: str = DEFAULT_FAILED_QUEUE_NAME,
+    policy: RedisReaperPolicy | None = None,
+    serializer: JsonSerializer | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+    batch_limit: int = 100,
+    hooks: Sequence[WorkerHook] = (),
+    error_delay: float = 1.0,
+    idle_delay: float = 1.0,
+    logger: logging.Logger | None = None,
+    stop_event: Event | None = None,
+) -> Worker:
+    """Build a `Worker` that periodically sweeps `channels` for stale Redis
+    claims, following the same runner/poller-adapter pattern
+    `Pybus.create_durable_job_worker` uses for durable-job polling."""
+
+    resolved_stop_event = stop_event or Event()
+    poller = RedisReaperPoller(
+        RedisReaperRunner(
+            transport,
+            channels,
+            dead_letter_channel=dead_letter_channel,
+            policy=policy,
+            serializer=serializer,
+            now_fn=now_fn,
+            batch_limit=batch_limit,
+        ),
+        idle_delay=idle_delay,
+        stop_event=resolved_stop_event,
+    )
+    return Worker(
+        poller,
+        "__pybus_redis_reaper__",
+        hooks=hooks,
+        error_delay=error_delay,
+        logger=logger,
+        stop_event=resolved_stop_event,
+    )
 
 
 def decode_legacy_redis_payload(payload: bytes | str) -> Any:
@@ -279,8 +566,12 @@ def decode_trusted_legacy_redis_payload(payload: bytes | str) -> Any:
 
 
 __all__ = [
+    "RedisReaperPolicy",
+    "RedisReaperPoller",
+    "RedisReaperRunner",
     "RedisScheduleStateStore",
     "RedisTransport",
+    "create_redis_reaper_worker",
     "decode_json_redis_payload",
     "decode_legacy_redis_payload",
     "decode_trusted_legacy_redis_payload",
