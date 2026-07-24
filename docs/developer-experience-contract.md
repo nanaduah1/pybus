@@ -226,10 +226,14 @@ processing list rather than losing it — `RedisReaperRunner`/`create_redis_reap
 periodically finds claims older than `RedisReaperPolicy.visibility_timeout` and
 redelivers or dead-letters them. The claim move and the claim-index write are
 two separate steps; a crash or indeterminate failure in that narrow window
-between them leaves the payload in the processing list with no index entry,
-which the reaper cannot yet discover — a known, tracked gap (see
-[pybus#57](https://github.com/nanaduah1/pybus/issues/57)). This is the
-raw-transport guarantee `Worker` runs on; the separate durable-job/outbox layer
+between them leaves the payload in the processing list with no index entry.
+The reaper reconciles this too — each sweep diffs the processing list against
+the claims index, and an entry confirmed unclaimed for a Redis-tracked grace
+period is reindexed into a normal, recoverable claim. That confirmation state
+lives in Redis rather than the reaper process, so it's correct even when
+multiple reaper instances run against the same channel (see
+[pybus#57](https://github.com/nanaduah1/pybus/issues/57) for the design). This
+is the raw-transport guarantee `Worker` runs on; the separate durable-job/outbox layer
 adds its own storage-backed persistence and reconciliation on top for
 applications that need a durable job record, not just durable transport
 delivery.
