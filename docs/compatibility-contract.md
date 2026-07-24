@@ -173,9 +173,13 @@ and settles via `ack`/`nack`, recovered on crash by `RedisReaperRunner` once the
 claim is durably indexed — satisfying ADR-004's compatibility consequence that
 Redis behavior remain compatible with current queues. (The move and the
 claim-index write are two separate steps; a crash or indeterminate failure
-between them leaves a payload the reaper cannot yet discover — tracked as
-[pybus#57](https://github.com/nanaduah1/pybus/issues/57).) Producer- and
-monitoring-side behavior is unchanged:
+between them leaves a payload with no index entry. `RedisReaperRunner`
+reconciles this — an entry confirmed unclaimed for a Redis-tracked grace
+period is reindexed into a normal, recoverable claim; the confirmation state
+is Redis-shared, not per-process, so it's correct even with multiple reaper
+instances on the same channel — see
+[pybus#57](https://github.com/nanaduah1/pybus/issues/57) for the design.)
+Producer- and monitoring-side behavior is unchanged:
 
 - `publish()` still does a plain `LPUSH` on the channel key — no wire-shape or
   producer-version change.

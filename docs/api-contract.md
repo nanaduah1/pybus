@@ -761,9 +761,15 @@ draining later queues on top of an unresolved claim, and the reaper is what
 ultimately recovers or terminates that claim rather than the worker retrying it
 inline. The claim itself is written in two steps (move into the processing
 list, then a separate index write); a crash or indeterminate failure in that
-narrow window leaves the payload in the processing list with no index entry,
-which the reaper cannot yet discover — a known, tracked gap (see [pybus#57](https://github.com/nanaduah1/pybus/issues/57)),
-not a case this guarantee currently covers. This is the raw-transport delivery
+narrow window leaves the payload in the processing list with no index entry.
+The reaper reconciles this too: each sweep diffs the processing list against
+the claims index, and an entry confirmed unclaimed for a Redis-tracked grace
+period is reindexed into a normal claim, recoverable within one
+visibility-timeout window like any other stale claim. The confirmation state
+lives in Redis rather than the reaper process, so it holds regardless of
+sweep cadence and stays correct if more than one reaper instance runs against
+the same channel (see [pybus#57](https://github.com/nanaduah1/pybus/issues/57)
+for the design rationale). This is the raw-transport delivery
 guarantee; it is separate from the durable-job/outbox persistence layer
 (§4.2), which adds its own storage-backed lease and reconciliation on top of
 whatever transport publishes the prepared command.

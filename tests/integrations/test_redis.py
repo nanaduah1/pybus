@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import pickle
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -59,6 +60,7 @@ class FakeRedisClient:
         self.lmove_error: Exception | None = None
         self.lrem_error: Exception | None = None
         self.hset_error: Exception | None = None
+        self.hsetnx_error: Exception | None = None
         self.hdel_error: Exception | None = None
         self.lpush_error: Exception | None = None
         self.get_error: Exception | None = None
@@ -142,6 +144,24 @@ class FakeRedisClient:
 
     def hget(self, key: str, field: str):
         return self.hashes.get(key, {}).get(field)
+
+    def hgetall(self, key: str) -> dict[str, bytes]:
+        return dict(self.hashes.get(key, {}))
+
+    def hsetnx(self, key: str, field: str, value) -> int:
+        if self.hsetnx_error is not None:
+            raise self.hsetnx_error
+        h = self.hashes.setdefault(key, {})
+        if field in h:
+            return 0
+        h[field] = value
+        return 1
+
+    def lrange(self, key: str, start: int, end: int) -> list[bytes]:
+        queue = self.queues.get(key, [])
+        if end == -1:
+            return list(queue[start:])
+        return list(queue[start : end + 1])
 
     def hdel(self, key: str, *fields: str) -> int:
         if self.hdel_error is not None:
@@ -900,6 +920,26 @@ def test_consume_raises_indeterminate_delivery_error_on_claim_record_failure() -
 
     # the message survived the failed claim-record write: still recoverable
     assert client.queues["pybus.jobs:processing"] == [b"payload"]
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
+
+    # ...and it's not just present — the reaper can actually discover and
+    # recover it despite the missing claim record (issue #57).
+    client.hset_error = None
+    clock = {"now": datetime.now(timezone.utc)}
+    runner = RedisReaperRunner(
+        transport,
+        ["pybus.jobs"],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        now_fn=lambda: clock["now"],
+    )
+    assert runner.run_once() == 0  # first sighting: recorded, not confirmed
+    clock["now"] += timedelta(seconds=31)
+    assert runner.run_once() == 1  # past the confirmation delay: reindexed
+    assert client.hashes.get("pybus.jobs:claims", {}) != {}
+    _backdate_claim(client, "pybus.jobs", age=timedelta(minutes=10))
+    assert runner.run_once() == 1  # now stale: reclaimed
+    assert client.queues["pybus.jobs:processing"] == []
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
 
 
 def test_consume_raises_indeterminate_delivery_error_on_index_write_failure() -> None:
@@ -911,8 +951,30 @@ def test_consume_raises_indeterminate_delivery_error_on_index_write_failure() ->
     with pytest.raises(IndeterminateDeliveryError):
         transport.consume("pybus.jobs")
 
-    # the message survived the failed index write: still recoverable
+    # the message survived the failed index write: still recoverable, and the
+    # failed attempt's own hash fields (hset landed, zadd didn't) were cleaned
+    # up at the source rather than leaking forever
     assert client.queues["pybus.jobs:processing"] == [b"payload"]
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
+
+    # ...and it's not just present — the reaper can actually discover and
+    # recover it despite the missing index entry (issue #57).
+    client.zadd_error = None
+    clock = {"now": datetime.now(timezone.utc)}
+    runner = RedisReaperRunner(
+        transport,
+        ["pybus.jobs"],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        now_fn=lambda: clock["now"],
+    )
+    assert runner.run_once() == 0  # first sighting: recorded, not confirmed
+    clock["now"] += timedelta(seconds=31)
+    assert runner.run_once() == 1  # past the confirmation delay: reindexed
+    assert client.hashes.get("pybus.jobs:claims", {}) != {}
+    _backdate_claim(client, "pybus.jobs", age=timedelta(minutes=10))
+    assert runner.run_once() == 1  # now stale: reclaimed
+    assert client.queues["pybus.jobs:processing"] == []
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
 
 
 def test_ack_raises_indeterminate_delivery_error_on_unknown_outcome() -> None:
@@ -1260,6 +1322,27 @@ def test_stale_claims_self_heals_orphaned_index_entry() -> None:
     assert client.sorted_sets["pybus.jobs:claims:index"] == {}
 
 
+def test_unclaimed_processing_entries_handles_duplicate_payloads_correctly() -> None:
+    """Three identical payloads in `processing`: two properly claimed
+    (indexed), one orphaned (its index entry removed, simulating an
+    hset-succeeded/zadd-failed partial claim write). The diff must return
+    exactly the one orphaned occurrence — not over- or under-count because
+    the payload bytes are identical."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    for _ in range(3):
+        transport.publish("pybus.jobs", b"dup")
+    claimed = [transport.consume("pybus.jobs") for _ in range(3)]
+    assert client.queues["pybus.jobs:processing"] == [b"dup", b"dup", b"dup"]
+
+    orphaned_claim_id = json.loads(claimed[0].receipt)["claim_id"]
+    client.sorted_sets["pybus.jobs:claims:index"].pop(orphaned_claim_id)
+
+    unclaimed = transport.unclaimed_processing_entries("pybus.jobs")
+
+    assert unclaimed == [b"dup"]
+
+
 def test_redis_reaper_policy_rejects_non_positive_visibility_timeout() -> None:
     with pytest.raises(ValueError, match="visibility_timeout"):
         RedisReaperPolicy(visibility_timeout=timedelta(0))
@@ -1268,6 +1351,11 @@ def test_redis_reaper_policy_rejects_non_positive_visibility_timeout() -> None:
 def test_redis_reaper_policy_rejects_invalid_max_reclaim_attempts() -> None:
     with pytest.raises(ValueError, match="max_reclaim_attempts"):
         RedisReaperPolicy(max_reclaim_attempts=-1)
+
+
+def test_redis_reaper_policy_rejects_non_positive_orphan_confirmation_delay() -> None:
+    with pytest.raises(ValueError, match="orphan_confirmation_delay"):
+        RedisReaperPolicy(orphan_confirmation_delay=timedelta(0))
 
 
 def test_redis_reaper_runner_requires_at_least_one_channel() -> None:
@@ -1432,6 +1520,275 @@ def test_reaper_raises_and_leaves_claim_recoverable_when_ack_is_indeterminate() 
     assert len(client.queues[f"{DEFAULT_QUEUE_NAME}:processing"]) == 1
     assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) != {}
     assert client.sorted_sets.get(f"{DEFAULT_QUEUE_NAME}:claims:index", {}) != {}
+
+
+def test_reaper_reconciles_and_recovers_a_message_orphaned_before_claim_recording() -> (
+    None
+):
+    """Simulates issue #57: a crash between the blmove/lmove claim-move and the
+    separate `_claim()` call that records it. The payload lands in
+    `<channel>:processing` with no claims-hash/index entry at all — unlike the
+    claim-pipeline-failure tests below, `_claim()` never even starts."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    serializer = JsonSerializer()
+    envelope = EventMessage(
+        message_type="billing.orphaned", payload={"id": 1}
+    ).to_envelope(message_id="orphan-1")
+    client.queues.setdefault(DEFAULT_QUEUE_NAME, []).insert(
+        0, serializer.dump(envelope)
+    )
+    client._move(
+        DEFAULT_QUEUE_NAME, f"{DEFAULT_QUEUE_NAME}:processing", "RIGHT", "LEFT"
+    )
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+    assert client.sorted_sets.get(f"{DEFAULT_QUEUE_NAME}:claims:index", {}) == {}
+
+    clock = {"now": datetime.now(timezone.utc)}
+    runner = RedisReaperRunner(
+        transport,
+        [DEFAULT_QUEUE_NAME],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        serializer=serializer,
+        now_fn=lambda: clock["now"],
+    )
+
+    # A single sighting only records a candidate — it must not act on it
+    # alone, since that could also be a live consumer between its own
+    # claim-move and `_claim()` call.
+    assert runner.run_once() == 0
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) == {}
+
+    # Confirmed unclaimed past the confirmation delay: reindexed into a
+    # normal, trackable claim.
+    clock["now"] += timedelta(seconds=31)
+    assert runner.run_once() == 1
+    assert client.hashes.get(f"{DEFAULT_QUEUE_NAME}:claims", {}) != {}
+    assert client.sorted_sets.get(f"{DEFAULT_QUEUE_NAME}:claims:index", {}) != {}
+    assert len(client.queues[f"{DEFAULT_QUEUE_NAME}:processing"]) == 1
+
+    # Once reindexed, it's a normal claim: it becomes reclaimable through the
+    # existing stale-claim path after one visibility-timeout window — no
+    # permanent loss.
+    _backdate_claim(client, DEFAULT_QUEUE_NAME, age=timedelta(minutes=10))
+    assert runner.run_once() == 1
+    assert client.queues[f"{DEFAULT_QUEUE_NAME}:processing"] == []
+    redelivered = MessageEnvelope.from_dict(
+        serializer.loads(transport.consume(DEFAULT_QUEUE_NAME))
+    )
+    assert redelivered.message_id == "orphan-1"
+    assert redelivered.headers["retries"] == 1
+
+
+def test_reaper_does_not_confirm_orphan_across_sweeps_with_no_elapsed_time() -> None:
+    """Proves the confirmation guard is wall-clock-gated, not sweep-count
+    gated: `RedisReaperPoller` skips its idle delay whenever a sweep finds
+    any work, so consecutive sweeps can land with no gap at all under load.
+    Calling `run_once()` repeatedly at the same instant must never reindex —
+    only real elapsed time confirms an orphan."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    client.queues.setdefault("pybus.jobs", []).insert(0, b"payload")
+    client._move("pybus.jobs", "pybus.jobs:processing", "RIGHT", "LEFT")
+
+    clock = {"now": datetime.now(timezone.utc)}
+    runner = RedisReaperRunner(
+        transport,
+        ["pybus.jobs"],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        now_fn=lambda: clock["now"],
+    )
+
+    for _ in range(5):
+        assert runner.run_once() == 0
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
+
+    clock["now"] += timedelta(seconds=31)
+    assert runner.run_once() == 1
+    assert client.hashes.get("pybus.jobs:claims", {}) != {}
+
+
+def test_two_reaper_instances_reindex_an_orphan_exactly_once() -> None:
+    """Proves the confirmation state is Redis-shared, not per-process: two
+    independent `RedisReaperRunner` instances pointed at the same
+    transport/client (an ordinary HA reaper deployment) must not both
+    reindex the same orphan — that would create a phantom duplicate claim
+    and, eventually, redeliver a message a second time after it was already
+    correctly processed under the first claim."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    client.queues.setdefault("pybus.jobs", []).insert(0, b"payload")
+    client._move("pybus.jobs", "pybus.jobs:processing", "RIGHT", "LEFT")
+
+    clock = {"now": datetime.now(timezone.utc)}
+    policy = RedisReaperPolicy(visibility_timeout=timedelta(minutes=5))
+    instance_a = RedisReaperRunner(
+        transport, ["pybus.jobs"], policy=policy, now_fn=lambda: clock["now"]
+    )
+    instance_b = RedisReaperRunner(
+        transport, ["pybus.jobs"], policy=policy, now_fn=lambda: clock["now"]
+    )
+
+    assert instance_a.run_once() == 0  # instance A's first sighting
+    assert instance_b.run_once() == 0  # instance B sees the same recorded sighting
+
+    clock["now"] += timedelta(seconds=31)
+    reindexed = instance_a.run_once() + instance_b.run_once()
+
+    assert reindexed == 1  # both confirm it, but only one wins the reindex
+    assert len(client.hashes.get("pybus.jobs:claims", {})) == 2  # one claim's fields
+
+
+def test_two_reaper_instances_race_on_the_same_confirmed_candidate() -> None:
+    """Forces the actual `HDEL` mutex the safety-auditor's finding is about:
+    both instances must reach the point of deciding to act on the SAME
+    confirmed candidate before either writes the real claim — not just
+    reach it sequentially after one has already written it (which is what
+    `test_two_reaper_instances_reindex_an_orphan_exactly_once` proves via
+    the earlier read-side filter, not this mutex). Achieved by having
+    instance A's `hdel` call on the candidates hash re-entrantly trigger
+    instance B's reconciliation attempt before A's own call resolves —
+    true interleaving without real threads."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    client.queues.setdefault("pybus.jobs", []).insert(0, b"payload")
+    client._move("pybus.jobs", "pybus.jobs:processing", "RIGHT", "LEFT")
+
+    clock = {"now": datetime.now(timezone.utc)}
+    policy = RedisReaperPolicy(visibility_timeout=timedelta(minutes=5))
+    instance_a = RedisReaperRunner(
+        transport, ["pybus.jobs"], policy=policy, now_fn=lambda: clock["now"]
+    )
+    instance_b = RedisReaperRunner(
+        transport, ["pybus.jobs"], policy=policy, now_fn=lambda: clock["now"]
+    )
+
+    assert instance_a.run_once() == 0  # both see the first sighting
+    assert instance_b.run_once() == 0
+    clock["now"] += timedelta(seconds=31)
+
+    candidates_key = RedisTransport._candidates_key("pybus.jobs")
+    digest = RedisTransport._payload_digest(b"payload")
+    real_hdel = client.hdel
+    triggered = {"done": False}
+    instance_b_result: dict[str, int] = {}
+
+    def racing_hdel(key, *fields):
+        if key == candidates_key and digest in fields and not triggered["done"]:
+            triggered["done"] = True
+            # Instance B reaches the same confirmed candidate and calls
+            # `hdel` first, winning the mutex before A's own call resolves.
+            # Captured rather than asserted here: this runs inside the SUT's
+            # own `except Exception: continue` around the `hdel` call, so an
+            # inline assertion failure would be silently swallowed instead
+            # of failing the test loudly.
+            instance_b_result["reindexed"] = instance_b.run_once()
+        return real_hdel(key, *fields)
+
+    client.hdel = racing_hdel
+
+    assert instance_a.run_once() == 0  # A loses the race: already claimed
+    assert instance_b_result["reindexed"] == 1  # B won and reindexed it
+    assert len(client.hashes.get("pybus.jobs:claims", {})) == 2  # exactly once
+
+
+def test_reaper_does_not_reindex_when_legitimately_claimed_before_confirmation() -> (
+    None
+):
+    """Proves the confirmation guard prevents the duplicate-claim race: if
+    the payload is legitimately claimed before the confirmation delay
+    elapses (the realistic non-crash case — the window just closes on its
+    own), reconciliation must not create a second, phantom claim record for
+    it."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    client.queues.setdefault("pybus.jobs", []).insert(0, b"payload")
+    client._move("pybus.jobs", "pybus.jobs:processing", "RIGHT", "LEFT")
+
+    clock = {"now": datetime.now(timezone.utc)}
+    runner = RedisReaperRunner(
+        transport,
+        ["pybus.jobs"],
+        policy=RedisReaperPolicy(visibility_timeout=timedelta(minutes=5)),
+        now_fn=lambda: clock["now"],
+    )
+
+    assert runner.run_once() == 0  # first sighting: unclaimed, just recorded
+
+    # Before confirmation, the claim record lands normally (as `_claim()`
+    # would) — this also clears the candidate marker as a side effect.
+    transport.reindex_orphaned_processing_entry("pybus.jobs", b"payload")
+    claim_after_legit_record = dict(client.hashes["pybus.jobs:claims"])
+
+    clock["now"] += timedelta(seconds=31)
+    assert runner.run_once() == 0  # already claimed: nothing left to reconcile
+    assert client.hashes["pybus.jobs:claims"] == claim_after_legit_record
+
+
+def test_reconcile_orphaned_processing_entries_self_heals_a_concurrently_cleared_candidate() -> (
+    None
+):
+    """`hsetnx` reporting a candidate already existed but a concurrent winner
+    having since cleared it (so `hget` finds nothing) must be skipped, not
+    misbehave — the candidate-marker analogue of `stale_claims()`'s existing
+    self-heal for an orphaned index entry."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    client.queues.setdefault("pybus.jobs", []).insert(0, b"payload")
+    client._move("pybus.jobs", "pybus.jobs:processing", "RIGHT", "LEFT")
+
+    candidates_key = RedisTransport._candidates_key("pybus.jobs")
+    digest = RedisTransport._payload_digest(b"payload")
+    real_hsetnx = client.hsetnx
+
+    def hsetnx_says_exists_but_gone(key, field, value):
+        if key == candidates_key and field == digest:
+            return 0  # reports "already existed"...
+        return real_hsetnx(key, field, value)
+
+    client.hsetnx = hsetnx_says_exists_but_gone
+    # ...but nothing was ever actually written, so `hget` finds it missing.
+
+    reconciled = transport.reconcile_orphaned_processing_entries(
+        "pybus.jobs", now=datetime.now(timezone.utc)
+    )
+
+    assert reconciled == 0
+    assert client.hashes.get("pybus.jobs:claims", {}) == {}
+
+
+def test_reconcile_orphaned_processing_entries_skips_when_hdel_is_indeterminate() -> (
+    None
+):
+    """If claiming the reindex right via `hdel` raises, the safe default is
+    to skip this sweep and retry later — not act without knowing whether
+    this instance actually won the race."""
+    client = FakeRedisClient()
+    transport = RedisTransport(client=client)
+    client.queues.setdefault("pybus.jobs", []).insert(0, b"payload")
+    client._move("pybus.jobs", "pybus.jobs:processing", "RIGHT", "LEFT")
+
+    now = datetime.now(timezone.utc)
+    transport.reconcile_orphaned_processing_entries("pybus.jobs", now=now)
+
+    candidates_key = RedisTransport._candidates_key("pybus.jobs")
+    digest = RedisTransport._payload_digest(b"payload")
+    real_hdel = client.hdel
+
+    def failing_hdel(key, *fields):
+        if key == candidates_key and digest in fields:
+            raise ConnectionError("connection dropped")
+        return real_hdel(key, *fields)
+
+    client.hdel = failing_hdel
+
+    reconciled = transport.reconcile_orphaned_processing_entries(
+        "pybus.jobs", now=now + timedelta(seconds=31)
+    )
+
+    assert reconciled == 0
+    # the candidate marker is untouched — still recorded, retryable next sweep
+    assert client.hashes.get(candidates_key, {}).get(digest) is not None
 
 
 def test_create_redis_reaper_worker_uses_distinct_sentinel_channels() -> None:

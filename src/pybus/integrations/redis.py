@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import math
 import pickle
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -94,15 +96,20 @@ class RedisTransport:
     `<channel>:claims:index`, scored by claim time) lets a reaper find stale
     claims via `stale_claims()` without scanning claim payloads.
 
-    Delivery guarantee: crash-safe at-least-once once a claim is durably
-    indexed. A claim that outlives its worker is not lost — `RedisReaperRunner`
-    (via `create_redis_reaper_worker`) finds it through `stale_claims()` and
-    redelivers or dead-letters it. The move into the processing list and the
-    claim-index write are two separate steps; a crash (or a raised exception
-    from the index write) between them leaves the payload in the processing
-    list with no index entry, which `stale_claims()` cannot discover — a known,
-    tracked gap (see https://github.com/nanaduah1/pybus/issues/57), not a case
-    this guarantee currently covers.
+    Delivery guarantee: crash-safe at-least-once. A claim that outlives its
+    worker is not lost — `RedisReaperRunner` (via `create_redis_reaper_worker`)
+    finds it through `stale_claims()` and redelivers or dead-letters it. The
+    move into the processing list and the claim-index write are two separate
+    steps; a crash (or a raised exception from the index write) between them
+    leaves the payload in the processing list with no index entry — even if
+    the claims-hash write landed, since `MULTI`/`EXEC` gives isolation, not
+    per-command rollback — which `stale_claims()` alone cannot discover, since
+    it enumerates via the index only. `RedisReaperRunner` closes that window
+    too, via `reconcile_orphaned_processing_entries()`: a processing-list
+    payload with no index entry, confirmed unclaimed for a Redis-tracked
+    grace period, is reindexed into a normal claim — recoverable within one
+    visibility-timeout window like any other stale claim (see
+    https://github.com/nanaduah1/pybus/issues/57).
     """
 
     def __init__(
@@ -202,8 +209,13 @@ class RedisTransport:
                 self._claims_index_key(channel),
                 {claim_id: claimed_at_dt.timestamp()},
             )
+            # Clears any orphan-candidate marker `reconcile_orphaned_processing_entries`
+            # left for this payload, whether this claim is the ordinary first one or a
+            # reindex of a previously orphaned entry.
+            pipeline.hdel(self._candidates_key(channel), self._payload_digest(payload))
             pipeline.execute()
         except Exception as exc:
+            self._cleanup_failed_claim_attempt(channel, claim_id)
             raise IndeterminateDeliveryError(
                 f"Redis claim record failed with an unknown outcome for {channel!r}"
             ) from exc
@@ -211,6 +223,23 @@ class RedisTransport:
             {"channel": channel, "claim_id": claim_id}, separators=(",", ":")
         )
         return ReceiptedMessage(payload, receipt)
+
+    def _cleanup_failed_claim_attempt(self, channel: str, claim_id: str) -> None:
+        """Best-effort: remove whatever this claim attempt's own pipeline may
+        have partially written — `MULTI`/`EXEC` gives isolation, not
+        per-command rollback, so `hset` can land even though `zadd` (or the
+        candidate cleanup) raised. Closes the leak at the source rather than
+        leaving indexless hash fields under a `claim_id` nothing will ever
+        resolve. Never raises — a cleanup failure must not shadow the
+        original `IndeterminateDeliveryError`."""
+        try:
+            self._client.hdel(
+                self._claims_key(channel),
+                self._payload_field(claim_id),
+                self._claimed_at_field(claim_id),
+            )
+        except Exception:
+            pass
 
     def _lookup_claim(self, receipt: str) -> tuple[str, str, bytes] | None:
         # Not atomic against a second concurrent ack/nack on the same receipt —
@@ -280,6 +309,129 @@ class RedisTransport:
             stale.append(ReceiptedMessage(payload, receipt))
         return stale
 
+    def unclaimed_processing_entries(
+        self, channel: str, *, limit: int = 100
+    ) -> list[bytes]:
+        """Return raw payloads sitting in `<channel>:processing` with no
+        corresponding *index* entry — the same gate `stale_claims()` reads,
+        via `<channel>:claims:index`, not the claims hash. A payload can be
+        stuck here two ways (issue #57): a crash (or raised exception) before
+        `_claim()`'s `hset`+`zadd` pipeline even starts, leaving no hash entry
+        either; or the pipeline's `hset` lands but its `zadd` doesn't (Redis
+        `MULTI`/`EXEC` gives isolation, not per-command rollback — a mid-batch
+        failure can leave a hash entry with no index entry). Either way,
+        `stale_claims()` can never discover it, since it enumerates via the
+        index only. Read-only: nothing is moved, removed, or reindexed. Pair
+        with `reindex_orphaned_processing_entry` to make an entry recoverable
+        through the normal claim/reaper path.
+
+        Bounded by `limit` on the processing-list scan only; indexed payloads
+        are resolved from the full index and claims hash so a truncated scan
+        can't misattribute an indexed occurrence outside the window and
+        produce a false unclaimed entry.
+        """
+        processing = self._client.lrange(self._processing_key(channel), 0, limit - 1)
+        indexed_claim_ids = {
+            self._decode(raw)
+            for raw in self._client.zrangebyscore(
+                self._claims_index_key(channel), "-inf", "+inf"
+            )
+        }
+        claims = self._client.hgetall(self._claims_key(channel)) or {}
+        indexed_payloads: Counter[bytes] = Counter()
+        for field, value in claims.items():
+            claim_id = self._payload_claim_id(field)
+            if claim_id is not None and claim_id in indexed_claim_ids:
+                indexed_payloads[value] += 1
+        unclaimed: list[bytes] = []
+        for payload in processing:
+            if indexed_payloads.get(payload, 0) > 0:
+                indexed_payloads[payload] -= 1
+                continue
+            unclaimed.append(payload)
+        return unclaimed
+
+    def reindex_orphaned_processing_entry(
+        self, channel: str, payload: bytes
+    ) -> ReceiptedMessage:
+        """Record a fresh claim for a payload already sitting in
+        `<channel>:processing` with no index entry, turning it into a
+        normal, trackable claim. Doesn't move the payload — it's already
+        there."""
+        return self._claim(channel, payload)
+
+    def reconcile_orphaned_processing_entries(
+        self,
+        channel: str,
+        *,
+        now: datetime,
+        limit: int = 100,
+        confirmation_delay: timedelta = timedelta(seconds=30),
+    ) -> int:
+        """Reindex processing-list payloads confirmed unclaimed for at least
+        `confirmation_delay` (issue #57), and return how many were reindexed.
+
+        A single sighting of an unclaimed payload can't tell a genuine crash
+        orphan apart from a live consumer that's merely between its own
+        claim-move and `_claim()` call — a real, if narrow, window in
+        `consume()`. So each unclaimed payload is tracked durably in Redis
+        (`<channel>:claims:candidates`, a hash of content-digest ->
+        first-seen timestamp) rather than in this process's memory: `HSETNX`
+        records the first sighting, and only once `now` is at least
+        `confirmation_delay` past that recorded time is the payload acted
+        on. Using Redis-shared, wall-clock-gated state (not an in-process
+        sighting counter) matters for two reasons: it holds regardless of
+        how close together sweeps land (a busy reaper can run back-to-back
+        with no idle delay), and it stays correct if more than one reaper
+        instance runs against the same channel — an ordinary HA deployment,
+        since the framework already treats concurrent consumers on one
+        channel as safe. The final step, claiming the right to reindex, is
+        an atomic `HDEL` on the candidate marker: only the instance whose
+        `HDEL` actually removes the field proceeds, so two instances
+        confirming the same orphan at the same time still reindex it exactly
+        once.
+        """
+        candidates_key = self._candidates_key(channel)
+        reconciled = 0
+        for payload in self.unclaimed_processing_entries(channel, limit=limit):
+            digest = self._payload_digest(payload)
+            if self._client.hsetnx(candidates_key, digest, now.isoformat()):
+                continue  # first sighting: recorded, not yet confirmed
+            recorded = self._client.hget(candidates_key, digest)
+            if recorded is None:
+                continue  # a concurrent reaper already claimed and cleared this
+            seen_at = datetime.fromisoformat(self._decode(recorded))
+            if now - seen_at < confirmation_delay:
+                continue  # confirmed unclaimed, but not long enough yet
+            try:
+                won_reindex_rights = self._client.hdel(candidates_key, digest) == 1
+            except Exception:
+                continue  # indeterminate: play safe, leave it for the next sweep
+            if not won_reindex_rights:
+                continue  # a concurrent reaper already claimed this one
+            self.reindex_orphaned_processing_entry(channel, payload)
+            reconciled += 1
+        return reconciled
+
+    @staticmethod
+    def _decode(value: bytes | str) -> str:
+        return value.decode("utf-8") if isinstance(value, bytes) else value
+
+    @staticmethod
+    def _payload_digest(payload: bytes) -> str:
+        return hashlib.sha1(payload).hexdigest()
+
+    @staticmethod
+    def _candidates_key(channel: str) -> str:
+        return f"{channel}:claims:candidates"
+
+    @classmethod
+    def _payload_claim_id(cls, field: bytes | str) -> str | None:
+        text = cls._decode(field)
+        if not text.endswith(":payload"):
+            return None
+        return text[: -len(":payload")]
+
     @staticmethod
     def _parse_receipt(receipt: str) -> tuple[str, str] | None:
         try:
@@ -326,6 +478,7 @@ class RedisReaperPolicy:
 
     visibility_timeout: timedelta = timedelta(minutes=5)
     max_reclaim_attempts: int = 5
+    orphan_confirmation_delay: timedelta = timedelta(seconds=30)
 
     def __post_init__(self) -> None:
         if not isinstance(self.visibility_timeout, timedelta) or (
@@ -338,13 +491,24 @@ class RedisReaperPolicy:
             or self.max_reclaim_attempts < 0
         ):
             raise ValueError("max_reclaim_attempts must be a non-negative integer")
+        if not isinstance(self.orphan_confirmation_delay, timedelta) or (
+            self.orphan_confirmation_delay <= timedelta(0)
+        ):
+            raise ValueError("orphan_confirmation_delay must be a positive timedelta")
 
 
 class RedisReaperRunner:
     """Reclaims stale Redis claims: redelivers them, or dead-letters them once
     reclaimed too many times, using the same `retries`/`last_attempt` header
     convention `Listener` uses so poison messages still terminate through the
-    existing dead-letter path."""
+    existing dead-letter path.
+
+    Each sweep also reconciles processing-list entries orphaned by a crash
+    between the claim-move and the claim-record write (issue #57), via
+    `RedisTransport.reconcile_orphaned_processing_entries` — see that
+    method's docstring for why the confirmation state lives in Redis rather
+    than this runner's own memory.
+    """
 
     def __init__(
         self,
@@ -372,9 +536,16 @@ class RedisReaperRunner:
         self._logger = logging.getLogger("pybus.redis_reaper")
 
     def run_once(self) -> int:
-        cutoff = self._now_fn() - self.policy.visibility_timeout
+        now = self._now_fn()
+        cutoff = now - self.policy.visibility_timeout
         reclaimed = 0
         for channel in self.channels:
+            reclaimed += self.transport.reconcile_orphaned_processing_entries(
+                channel,
+                now=now,
+                limit=self.batch_limit,
+                confirmation_delay=self.policy.orphan_confirmation_delay,
+            )
             stale = self.transport.stale_claims(
                 channel, older_than=cutoff, limit=self.batch_limit
             )
